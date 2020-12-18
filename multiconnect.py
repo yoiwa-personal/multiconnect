@@ -10,9 +10,10 @@ import re
 import select
 
 class Connector(Thread):
-    def __init__(self, wait, host, port, ret):
+    def __init__(self, wait, host, mask, port, ret):
         super().__init__(daemon=True)
         self.host = host
+        self.mask = mask
         self.port = port
         self.ret = ret
         self.wait = wait
@@ -27,6 +28,19 @@ class Connector(Thread):
             addr = socket.getaddrinfo(self.host, self.port,
                                       family=socket.AF_INET,
                                       proto=socket.IPPROTO_TCP)
+            if self.mask:
+                usock = socket.socket(type=socket.SOCK_DGRAM)
+                usock.connect(addr[0][4])
+                saddr = usock.getsockname()
+                raddr = int.from_bytes(socket.inet_aton(addr[0][4][0]), 'big')
+                laddr = int.from_bytes(socket.inet_aton(saddr[0]), 'big')
+                mask = ((1 << self.mask) - 1) << (32 - self.mask)
+                lnaddr = laddr & mask
+                lnaddrs = socket.inet_ntoa(lnaddr.to_bytes(4, 'big'))
+                if (raddr & mask) != lnaddr:
+                    raise RuntimeError("{} does not belong to network {}/{}".format(
+                        addr[0][4][0], lnaddrs, self.mask))
+
             #time.sleep(self.wait)
             if self.wait:
                 try:
@@ -73,8 +87,8 @@ class Connector(Thread):
         q = queue.Queue()
         l = []
         c = None
-        for w, h, p in hosts:
-            l.append(Connector(w, h, p, q))
+        for w, h, m, p in hosts:
+            l.append(Connector(w, h, m, p, q))
 
         for x in l:
             x.start()
@@ -143,14 +157,16 @@ class Forwarder(Thread):
 def main(argv):
     hostlist = []
     for hspec in argv:
-        mo = re.match(r"^(?:(\d+(?:\.\d+)?):)?([^:]+):(\d+)$", hspec)
+        mo = re.match(r"^(?:(\d+(?:\.\d+)?):)?([^/:]+)(?:/(\d+))?:(\d+)$", hspec)
         if not mo:
             raise RuntimeError("bad spec: {}".format(hspec))
         w = mo.group(1)
         w = float(w) if w else 0.0
         h = mo.group(2)
-        p = int(mo.group(3))
-        hostlist.append((w, h, p))
+        nm = mo.group(3)
+        nm = int(nm) if nm else None
+        p = int(mo.group(4))
+        hostlist.append((w, h, nm, p))
 
     if not len(hostlist):
         print("no host list given.", file=sys.stderr)
