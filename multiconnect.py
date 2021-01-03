@@ -27,33 +27,32 @@ class Connector(Thread):
             self.sock = socket.socket()
             addr = socket.getaddrinfo(self.host, self.port,
                                       family=socket.AF_INET,
-                                      proto=socket.IPPROTO_TCP)
+                                      proto=socket.IPPROTO_TCP)[0][4]
             if self.mask:
+                import ipaddress
                 usock = socket.socket(type=socket.SOCK_DGRAM)
-                usock.connect(addr[0][4])
-                saddr = usock.getsockname()
-                raddr = int.from_bytes(socket.inet_aton(addr[0][4][0]), 'big')
-                laddr = int.from_bytes(socket.inet_aton(saddr[0]), 'big')
-                mask = ((1 << self.mask) - 1) << (32 - self.mask)
-                lnaddr = laddr & mask
-                lnaddrs = socket.inet_ntoa(lnaddr.to_bytes(4, 'big'))
-                if (raddr & mask) != lnaddr:
-                    raise RuntimeError("{} does not belong to network {}/{}".format(
-                        addr[0][4][0], lnaddrs, self.mask))
+                usock.connect(addr)
+                laddr = usock.getsockname()
+
+                remoteip = ipaddress.ip_address(addr[0])
+                local_if = ipaddress.ip_interface("%s/%d" % (laddr[0], self.mask))
+                if remoteip not in local_if.network:
+                    raise RuntimeError("{} does not belong to network {}".format(
+                        remoteip, local_if))
 
             #time.sleep(self.wait)
             if self.wait:
                 try:
-#                    print ("waiting {} sec with {}".format(self.wait, self.sock), file=sys.stderr)
+                    # print ("waiting {} sec with {}".format(self.wait, self.sock), file=sys.stderr)
                     self.waitchan.get(timeout=self.wait)
-#                    print ("waiting {} sec with {} -> rcvd".format(self.wait, self.sock), file=sys.stderr)
+                    # print ("waiting {} sec with {} -> rcvd".format(self.wait, self.sock), file=sys.stderr)
                     return
                 except queue.Empty:
-#                    print ("waiting {} sec with {} -> none".format(self.wait, self.sock), file=sys.stderr)
+                    # print ("waiting {} sec with {} -> none".format(self.wait, self.sock), file=sys.stderr)
                     pass
             if self.no_start:
                 return
-            self.sock.connect(addr[0][4])
+            self.sock.connect(addr)
             print("CONNECTED to {}:{}".format(self.host, self.port), file=sys.stderr)
             self.ret.put(self.sock)
         except:
@@ -67,19 +66,19 @@ class Connector(Thread):
         if self.done:
             return
         self.no_start = True
-#        print ("sending abort to waiting {} sec with {}".format(self.wait, self.sock), file=sys.stderr)
+        # print ("sending abort to waiting {} sec with {}".format(self.wait, self.sock), file=sys.stderr)
         self.waitchan.put(True)
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
-#            print("shutdown failed", file=sys.stderr)
-#            traceback.print_exc()
+            # print("shutdown failed", file=sys.stderr)
+            # traceback.print_exc()
             pass
         try:
             self.sock.close()
         except OSError:
-#            print("close failed", file=sys.stderr)
-#            traceback.print_exc()
+            # print("close failed", file=sys.stderr)
+            # traceback.print_exc()
             pass
 
     @classmethod
@@ -128,7 +127,7 @@ class Forwarder(Thread):
                     r = self.fr.read(bufsize)
                 if not r:
                     break
-#                print("read {}".format(r), file=sys.stderr)
+                # print("read {}".format(r), file=sys.stderr)
                 if self.f:
                     self.to.write(r)
                 else:
