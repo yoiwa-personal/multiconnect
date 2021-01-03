@@ -112,33 +112,35 @@ class Connector(Thread):
 bufsize = 1048576
 class Forwarder(Thread):
     
-    def __init__(self, f, fr, to):
+    def __init__(self, fr, to):
         super().__init__(daemon=False)
         self.fr = fr
         self.to = to
-        self.f = f
+        self.rd = fr.read if hasattr(fr, "read") else fr.recv
+        self.wr = to.write if hasattr(to, "write") else to.send
+        # adhoc polymorphism: socket lacks read/write (only socketIO has)
 
     def run(self):
         try:
             while(True):
-                if self.f:
-                    r = self.fr.recv(bufsize)
-                else:
-                    r = self.fr.read(bufsize)
+                r = self.rd(bufsize)
                 if not r:
                     break
-                # print("read {}".format(r), file=sys.stderr)
-                if self.f:
-                    self.to.write(r)
-                else:
-                    self.to.send(r)
+
+                l = len(r)
+                r = memoryview(r) # make slicing faster
+                while (l > 0):
+                    x = self.wr(r)
+                    assert x > 0
+                    l -= x
+                    r = r[x:]
         except OSError:
             print("send failed", file=sys.stderr)
             traceback.print_exc()
 
-        if not self.f:
+        if hasattr(self.to, "shutdown"):
             try:
-                self.to.shutdown(socket.SHUT_WR)
+                self.to.shutdown(socket.SHUT_WR) # safer to use raw socket because of this
             except OSError:
                 print("shutdown failed", file=sys.stderr)
                 traceback.print_exc()
@@ -175,11 +177,11 @@ def main(argv):
 
     if not c:
         print("cannot connect to any given host.", file=sys.stderr)
-        sys.exit(2)
+        sys.exit(1)
     
     Forwarder.run_parallel(
-        ((True, c, sys.stdout.buffer.raw),
-         (False, sys.stdin.buffer.raw, c)))
+        ((c, sys.stdout.buffer.raw),
+         (sys.stdin.buffer.raw, c)))
 
     c.close()
 
