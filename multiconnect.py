@@ -1,22 +1,58 @@
 #!/usr/bin/python3
+"""
+multiconnect: choose fastest TCP/IP connection.
+"""
+# (c) 2018-2021 Yutaka OIWA <yutaka@oiwa.jp>.
+# All rights reserved.
+# Redistributable under Apache License, version 2.0.
+# See <https://www.apache.org/licenses/LICENSE-2.0>
+
 import sys
 import threading
 from threading import Thread
+from collections import namedtuple
 import queue
 import socket
 import traceback
 import time
 import re
 import select
+import argparse
+
+class HostSpec(namedtuple('HostSpec', ['wait', 'host', 'mask', 'port'])):
+    def __str__(self):
+        w = ("%g:" % self.wait) if self.wait else ""
+        m = ("/%d" % self.mask) if self.mask else ""
+        return "%s%s%s:%d" % (w, self.host, m, self.port)
+    def short_str(self):
+        return "%s:%d" % (self.host, self.port)
 
 class Connector(Thread):
-    def __init__(self, wait, host, mask, port, ret):
+    def __init__(self, hostspec, ret, msg, diag):
+        """
+Tries to make an connection on background.
+
+Use Connector.get_fastest_connection().
+"""
+        # Initializer arguments:
+        #  - hostspec: see get_fastest_connection().
+        #  - ret (Queue):
+        #     a channel to send a result.
+        #     Possible messages to be sent are either a Socket or None.
+        #  - msg (appendable sequence):
+        #     a channel to gather a short diagnostic messages.
+        #  - diagmsg (appendable sequence):
+        #     a channel to gather an diagnostic messages.
+        #
+        # Instance variables for internal communications:
+        #   - .sock: socket on working.
+        #   - .no_start: if set to True from outside, the instance will not continue connecting.
+        #   - .done: set to True by itself, meaning that the socket is already closed.
         super().__init__(daemon=True)
-        self.host = host
-        self.mask = mask
-        self.port = port
+        self.hs = hostspec
         self.ret = ret
-        self.wait = wait
+        self.msg = msg
+        self.diag = diag
         self.sock = None
         self.no_start = False
         self.done = False
@@ -25,69 +61,95 @@ class Connector(Thread):
     def run(self):
         try:
             self.sock = socket.socket()
-            addr = socket.getaddrinfo(self.host, self.port,
+            addr = socket.getaddrinfo(self.hs.host, self.hs.port,
                                       family=socket.AF_INET,
                                       proto=socket.IPPROTO_TCP)[0][4]
-            if self.mask:
+            if self.hs.mask:
+                # Applying connect() to UDP socket will resolve routing and
+                # get an appropriate source address for reaching that destination.
                 import ipaddress
                 usock = socket.socket(type=socket.SOCK_DGRAM)
                 usock.connect(addr)
                 laddr = usock.getsockname()
 
                 remoteip = ipaddress.ip_address(addr[0])
-                local_if = ipaddress.ip_interface("%s/%d" % (laddr[0], self.mask))
+                local_if = ipaddress.ip_interface("%s/%d" % (laddr[0], self.hs.mask))
                 if remoteip not in local_if.network:
                     raise RuntimeError("{} does not belong to network {}".format(
                         remoteip, local_if))
 
-            #time.sleep(self.wait)
-            if self.wait:
+            if self.hs.wait:
+                # Timed wait with interruption: self.waitchan is used for interuupt.
                 try:
-                    # print ("waiting {} sec with {}".format(self.wait, self.sock), file=sys.stderr)
-                    self.waitchan.get(timeout=self.wait)
-                    # print ("waiting {} sec with {} -> rcvd".format(self.wait, self.sock), file=sys.stderr)
+                    self.waitchan.get(timeout=self.hs.wait)
                     return
                 except queue.Empty:
-                    # print ("waiting {} sec with {} -> none".format(self.wait, self.sock), file=sys.stderr)
                     pass
             if self.no_start:
                 return
             self.sock.connect(addr)
-            print("CONNECTED to {}:{}".format(self.host, self.port), file=sys.stderr)
+            self.msg.append("CONNECTED to {}:{}".format(self.hs.host, self.hs.port))
             self.ret.put(self.sock)
         except:
             if not self.no_start:
-                print("connect failed", file=sys.stderr)
-                traceback.print_exc()
                 self.done = True
+                self.__ignore_os_error(self.sock.close)
+                m = "%s: connection failed\n%s\n" % (str(self.hs), traceback.format_exc())
+                self.diag.append(m)
             self.ret.put(None)
 
     def abort_connection(self):
+        """abort connection attempts, racing with running thread."""
         if self.done:
+            # someone (the runner or another call of abort_connection) is already taking care. No-op.
             return
+
+        self.done = True
+        # 1. tell the runner that no more attempt needed.
         self.no_start = True
-        # print ("sending abort to waiting {} sec with {}".format(self.wait, self.sock), file=sys.stderr)
+        # 2. if time-waiting, interrupt it.
         self.waitchan.put(True)
+        # 3. if already start connecting, forcibly destroy the socket.
+        #    This will interrupt connect() call.
+        self.__ignore_os_error(self.sock.shutdown, socket.SHUT_RDWR)
+        self.__ignore_os_error(self.sock.close)
+
+    @staticmethod
+    def __ignore_os_error(f, *a, **ka):
         try:
-            self.sock.shutdown(socket.SHUT_RDWR)
+            f(*a, **ka)
         except OSError:
-            # print("shutdown failed", file=sys.stderr)
-            # traceback.print_exc()
-            pass
-        try:
-            self.sock.close()
-        except OSError:
-            # print("close failed", file=sys.stderr)
-            # traceback.print_exc()
             pass
 
     @classmethod
     def get_fastest_connection(klass, hosts):
+        """
+    Try simultanously connecting to given host lists and return the fastest one.
+
+    Argument is a list of HostSpec's containing the following fields:
+
+      - wait (real): seconds to delay connections.
+
+      - host (string): a target host name or an IPv4 address to connect.
+
+      - mask (optional integer):
+        a number of bits for IPv4 netmask.
+        If the target host does not belong to the same network as the running host,
+        the connection will not be attempted.
+
+      - port (integer): a TCP port number to connect.
+
+    Returning a tuple of (c, m, dg), where
+      - c is a connected TCP socket channel or None,
+      - m, dg is a string containing message and diagnostic messages.
+"""
         q = queue.Queue()
+        msg = []
+        diag = []
         l = []
         c = None
-        for w, h, m, p in hosts:
-            l.append(Connector(w, h, m, p, q))
+        for hs in hosts:
+            l.append(Connector(hs, q, msg, diag))
 
         for x in l:
             x.start()
@@ -96,7 +158,6 @@ class Connector(Thread):
         while (left > 0):
             c = q.get()
             left -= 1
-            #print("got c:{}".format(c))
             if c:
                 break
 
@@ -107,11 +168,13 @@ class Connector(Thread):
         for x in l:
             x.join()
 
-        return c
+        msg = "\n".join(msg)
+        diag = "\n".join(diag)
+
+        return c, msg, diag
 
 bufsize = 1048576
 class Forwarder(Thread):
-    
     def __init__(self, fr, to):
         super().__init__(daemon=False)
         self.fr = fr
@@ -155,9 +218,38 @@ class Forwarder(Thread):
         for t in l:
             t.join()
 
-def main(argv):
+def main():
     hostlist = []
-    for hspec in argv:
+
+    parser = argparse.ArgumentParser(
+        description = "Choose the fastest connection from destination candidates.",
+        epilog="""Syntax for each hostspec is "[<delay>:]<host>[/<mask>]:<port>".
+
+It can be as simple as "host:port" (e.g. "example.com:22"), or
+as complex as "0.5:192.0.2.45/24:443".
+
+The optional prefix <delay> is a decimal floating number of seconds
+for delaying connection attempts to start.
+
+The optional <mask> specifies the number of netmask bits for the
+expected local network.  If the destination IP address does not fall
+into the same network of this host, as determined by the mask bits,
+connection will not be tried.
+
+The above example means that if the current host is in 192.2.50.0/24
+network, try connecting to IPv4 address 192.0.2.45, TCP port 443,
+after waiting a half second.
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('hosts', metavar='hostspec', type=str, nargs='+',
+                        help="connection destination candidates")
+    parser.add_argument('--verbose', '-v', nargs='?', type=int, default=1,
+                        help="verbosity level")
+
+    args = parser.parse_args()
+
+    for hspec in args.hosts:
         mo = re.match(r"^(?:(\d+(?:\.\d+)?):)?([^/:]+)(?:/(\d+))?:(\d+)$", hspec)
         if not mo:
             raise RuntimeError("bad spec: {}".format(hspec))
@@ -167,17 +259,20 @@ def main(argv):
         nm = mo.group(3)
         nm = int(nm) if nm else None
         p = int(mo.group(4))
-        hostlist.append((w, h, nm, p))
+        hostlist.append(HostSpec(wait = w, host = h, mask = nm, port = p))
 
-    if not len(hostlist):
-        print("no host list given.", file=sys.stderr)
-        sys.exit(2)
-    
-    c = Connector.get_fastest_connection(hostlist)
+    c, msg, diag = Connector.get_fastest_connection(hostlist)
 
     if not c:
         print("cannot connect to any given host.", file=sys.stderr)
+        print(msg, file=sys.stderr)
+        print(diag, file=sys.stderr)
         sys.exit(1)
+
+    if args.verbose >= 1:
+        print(msg, file=sys.stderr)
+        if args.verbose >= 2:
+            print(diag, file=sys.stderr)
     
     Forwarder.run_parallel(
         ((c, sys.stdout.buffer.raw),
@@ -188,4 +283,4 @@ def main(argv):
     sys.exit(0)
 
 if __name__=='__main__':
-    main(sys.argv[1:])
+    main()
