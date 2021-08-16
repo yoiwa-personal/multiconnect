@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """
-multiconnect: choose fastest TCP/IP connection.
+multiconnect: A TCP proxy choosing fastest TCP/IP connection.
 """
 # (c) 2018-2021 Yutaka OIWA <yutaka@oiwa.jp>.
 # All rights reserved.
@@ -218,11 +218,30 @@ class Forwarder(Thread):
         for t in l:
             t.join()
 
+# using an undocumneted interface...
+class ParagraphFillingFormatter(argparse.RawDescriptionHelpFormatter):
+    def __init__(self, prog, indent_increment=2, max_help_position=24, width=None):
+        if not width:
+            # backport from Python 3.9
+            import shutil
+            width = shutil.get_terminal_size().columns - 2
+        super().__init__(prog, indent_increment, max_help_position, width)
+
+    def _fill_text(self, text, width, indent):
+        # original wrapping routine, honoring paragraph break by double LF.
+        import textwrap
+        ps = re.split(r'\n\n+', text)
+        ps = [textwrap.wrap(text, width) for text in ps]
+        ps = [[indent + text for text in p] for p in ps]
+        ps = ['\n'.join(p) for p in ps]
+        ps = '\n\n'.join(ps)
+        return ps
+
 def main():
     hostlist = []
 
     parser = argparse.ArgumentParser(
-        description = "Choose the fastest connection from destination candidates.",
+        description = "TCP proxy choosing the fastest connection from destination candidates.",
         epilog="""Syntax for each hostspec is "[<delay>:]<host>[/<mask>]:<port>".
 
 It can be as simple as "host:port" (e.g. "example.com:22"), or
@@ -239,15 +258,23 @@ connection will not be tried.
 The above example means that if the current host is in 192.2.50.0/24
 network, try connecting to IPv4 address 192.0.2.45, TCP port 443,
 after waiting a half second.
+
+
 """,
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        formatter_class=ParagraphFillingFormatter #argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument('hosts', metavar='hostspec', type=str, nargs='+',
                         help="connection destination candidates")
-    parser.add_argument('--verbose', '-v', nargs='?', type=int, default=1,
-                        help="verbosity level")
+    parser.add_argument('-v', '--verbose', action='count', default=1,
+                        help="increse verbosity level")
+    parser.add_argument('-q', '--quiet', action='store_const', dest='verbose', const=0,
+                        help="set verbosity level to 0")
 
     args = parser.parse_args()
+
+#    if len(args.hosts) == 0:
+#        parser.print_help()
+#        sys.exit(2)
 
     for hspec in args.hosts:
         mo = re.match(r"^(?:(\d+(?:\.\d+)?):)?([^/:]+)(?:/(\d+))?:(\d+)$", hspec)
