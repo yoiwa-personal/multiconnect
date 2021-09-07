@@ -19,16 +19,22 @@ import re
 import select
 import argparse
 
-class HostSpec(namedtuple('HostSpec', ['wait', 'host', 'mask', 'port'])):
+_debug = False
+def dp(f, **k):
+    if _debug:
+        print(f.format(**k), file=sys.stderr)
+
+class HostSpec(namedtuple('HostSpec', ['wait', 'host', 'mask', 'port', 'cascade'])):
     def __str__(self):
+        c = "* " if self.cascade else ""
         w = ("%g:" % self.wait) if self.wait else ""
         m = ("/%d" % self.mask) if self.mask else ""
-        return "%s%s%s:%d" % (w, self.host, m, self.port)
+        return "%s%s%s%s:%d" % (c, w, self.host, m, self.port)
     def short_str(self):
         return "%s:%d" % (self.host, self.port)
 
 class Connector(Thread):
-    def __init__(self, hostspec, ret, msg, diag):
+    def __init__(self, hostspec, ret, msg, diag, prev):
         """
 Tries to make an connection on background.
 
@@ -48,7 +54,7 @@ Use Connector.get_fastest_connection().
         #   - .sock: socket on working.
         #   - .no_start: if set to True from outside, the instance will not continue connecting.
         #   - .done: set to True by itself, meaning that the socket is already closed.
-        super().__init__(daemon=True)
+        super().__init__(daemon=True, name=repr(str(hostspec)))
         self.hs = hostspec
         self.ret = ret
         self.msg = msg
@@ -57,13 +63,40 @@ Use Connector.get_fastest_connection().
         self.no_start = False
         self.done = False
         self.waitchan = queue.Queue()
+        self.nextchan = None
+        self.next_cascade = False
+        if prev:
+            prev.register_as_next(self, cascade=hostspec.cascade)
 
     def run(self):
         try:
+            if self.no_start:
+                return
             self.sock = socket.socket()
+            dp("{hs} start running", hs=self.hs)
+            if self.hs.wait or True:
+                # Timed wait with interruption: self.waitchan is used for interuupt.
+                dp("{hs} start waiting for {w} seconds", hs=self.hs, w=self.hs.wait)
+                try:
+                    r = self.waitchan.get(timeout=self.hs.wait)
+                    dp("{hs} received cascade signal {r}", hs=self.hs, r=r)
+                    if not r:
+                        dp("{hs} requested connection cancel", hs=self.hs, r=r)
+                        self.no_start = True
+                    else:
+                        dp("{hs} requested connection early start", hs=self.hs, r=r)
+                except queue.Empty:
+                    pass
+            if self.nextchan:
+                self.nextchan.start()
+            if self.no_start:
+                return
+
+            dp("{hs} wait finished starting", hs=self.hs)
             addr = socket.getaddrinfo(self.hs.host, self.hs.port,
                                       family=socket.AF_INET,
                                       proto=socket.IPPROTO_TCP)[0][4]
+
             if self.hs.mask:
                 # Applying connect() to UDP socket will resolve routing and
                 # get an appropriate source address for reaching that destination.
@@ -75,31 +108,30 @@ Use Connector.get_fastest_connection().
                 remoteip = ipaddress.ip_address(addr[0])
                 local_if = ipaddress.ip_interface("%s/%d" % (laddr[0], self.hs.mask))
                 if remoteip not in local_if.network:
-                    raise RuntimeError("{} does not belong to network {}".format(
+                    raise RuntimeError("{} not in network {}".format(
                         remoteip, local_if))
 
-            if self.hs.wait:
-                # Timed wait with interruption: self.waitchan is used for interuupt.
-                try:
-                    self.waitchan.get(timeout=self.hs.wait)
-                    return
-                except queue.Empty:
-                    pass
             if self.no_start:
                 return
+            dp("{hs} connecting", hs=self.hs)
             self.sock.connect(addr)
+            dp("{hs} connected", hs=self.hs)
             self.msg.append("CONNECTED to {}:{}".format(self.hs.host, self.hs.port))
             self.ret.put(self.sock)
-        except:
+        except (RuntimeError, OSError) as e:
+            dp("{hs} connection failed {e}", hs=self.hs, e=e)
             if not self.no_start:
                 self.done = True
                 self.__ignore_os_error(self.sock.close)
                 m = "%s: connection failed\n%s\n" % (str(self.hs), traceback.format_exc())
                 self.diag.append(m)
+            if self.next_cascade:
+                self.nextchan.waitchan.put(True)
             self.ret.put(None)
 
     def abort_connection(self):
-        """abort connection attempts, racing with running thread."""
+        """abort connection attempts, racing with the running thread."""
+        dp("{hs} try aborting", hs=self.hs)
         if self.done:
             # someone (the runner or another call of abort_connection) is already taking care. No-op.
             return
@@ -108,17 +140,27 @@ Use Connector.get_fastest_connection().
         # 1. tell the runner that no more attempt needed.
         self.no_start = True
         # 2. if time-waiting, interrupt it.
-        self.waitchan.put(True)
+        self.waitchan.put(False)
         # 3. if already start connecting, forcibly destroy the socket.
-        #    This will interrupt connect() call.
-        self.__ignore_os_error(self.sock.shutdown, socket.SHUT_RDWR)
-        self.__ignore_os_error(self.sock.close)
+        #    This will interrupt connect() call on pure Linux.
+        #    (not working on WSL, however.)
+        if self.sock:
+            dp("{hs} try shutdown", hs=self.hs)
+            self.__ignore_os_error(self.sock.shutdown, socket.SHUT_RDWR)
+            dp("{hs} try close", hs=self.hs)
+            self.__ignore_os_error(self.sock.close)
+
+    def register_as_next(self, next, cascade):
+        assert(self.nextchan is None)
+        self.nextchan = next
+        self.next_cascade = cascade
 
     @staticmethod
     def __ignore_os_error(f, *a, **ka):
         try:
             f(*a, **ka)
-        except OSError:
+        except OSError as e:
+            dp("... ignoring OS error {e}", e=e)
             pass
 
     @classmethod
@@ -148,11 +190,13 @@ Use Connector.get_fastest_connection().
         diag = []
         l = []
         c = None
+        o = None
         for hs in hosts:
-            l.append(Connector(hs, q, msg, diag))
+            dp("prev={o} hs={hs}", o=o, hs=hs)
+            o = Connector(hs, q, msg, diag, prev=o)
+            l.append(o)
 
-        for x in l:
-            x.start()
+        l[0].start()
 
         left = len(l)
         while (left > 0):
@@ -161,12 +205,21 @@ Use Connector.get_fastest_connection().
             if c:
                 break
 
-        for x in l:
+        for x in reversed(l):
             if x.sock is not c:
                 x.abort_connection()
 
         for x in l:
-            x.join()
+            try:
+                x.join(timeout=0.05)
+                # If connection cancelling is not working, or
+                # connection attempt is blocked on DNS resolving,
+                # this join will block.  Ignore any error with
+                # a tiny waiting allowance.
+                if x.is_alive():
+                    dp("debug oops: {x} still alive.  ignoring.", x=x)
+            except RuntimeError:
+                pass
 
         msg = "\n".join(msg)
         diag = "\n".join(diag)
@@ -247,8 +300,10 @@ def main():
 It can be as simple as "host:port" (e.g. "example.com:22"), or
 as complex as "0.5:192.0.2.45/24:443".
 
-The optional prefix <delay> is a decimal floating number of seconds
-for delaying connection attempts to start.
+If an optional floating-number prefix <delay> is given, connection is
+attempted after the given second is passed since the connection
+attempt for the previous argument is started.  The delay is cancelled
+if previous argument's connection is determined to be failed.
 
 The optional <mask> specifies the number of netmask bits for the
 expected local network.  If the destination IP address does not fall
@@ -275,18 +330,22 @@ after waiting a half second.
 #    if len(args.hosts) == 0:
 #        parser.print_help()
 #        sys.exit(2)
+    global _debug
+    if args.verbose >= 3:
+        _debug = True
 
     for hspec in args.hosts:
-        mo = re.match(r"^(?:(\d+(?:\.\d+)?):)?([^/:]+)(?:/(\d+))?:(\d+)$", hspec)
+        mo = re.match(r"^((?P<cascade>[-*])?(?P<wait>\d+(\.\d+)?):)?(?P<host>[^/:]+)(/(?P<mask>\d+))?:(?P<port>\d+)$", hspec)
         if not mo:
             raise RuntimeError("bad spec: {}".format(hspec))
-        w = mo.group(1)
+        w = mo.group('wait')
         w = float(w) if w else 0.0
-        h = mo.group(2)
-        nm = mo.group(3)
+        h = mo.group('host')
+        nm = mo.group('mask')
         nm = int(nm) if nm else None
-        p = int(mo.group(4))
-        hostlist.append(HostSpec(wait = w, host = h, mask = nm, port = p))
+        p = int(mo.group('port'))
+        c = mo.group('cascade') is None
+        hostlist.append(HostSpec(wait = w, host = h, mask = nm, port = p, cascade=c))
 
     c, msg, diag = Connector.get_fastest_connection(hostlist)
 
