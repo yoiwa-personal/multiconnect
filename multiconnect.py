@@ -33,6 +33,9 @@ class HostSpec(namedtuple('HostSpec', ['wait', 'host', 'mask', 'port', 'cascade'
     def short_str(self):
         return "%s:%d" % (self.host, self.port)
 
+class ConnectionAborted(RuntimeError):
+    pass
+
 class Connector(Thread):
     def __init__(self, hostspec, ret, msg, diag, prev):
         """
@@ -65,15 +68,67 @@ Use Connector.get_fastest_connection().
         self.waitchan = queue.Queue()
         self.nextchan = None
         self.next_cascade = False
+        self.atomic_lock = threading.Lock()
         if prev:
             prev.register_as_next(self, cascade=hostspec.cascade)
 
     def run(self):
-        try:
+        # assignment to and status check on the following variables are
+        # protected by self.atomic_lock:
+
+        #   - self.no_start
+        #   - self.done
+        #   - self.socket
+
+        # Combinations of self.no_start and self.done at status checking:
+        #  self.no_start,
+        #  |   self.done:
+
+        #  f   f    This thread is working.  Check no_start on next opportunity.
+
+        #  f   f    This thread is acquired a working remote connection.
+        #           (abort_connection() can still be called.)
+
+        #  f   T    This worker thread is failed to create a working connection.
+        #             This thread takes responsibility to destroy the socket.
+
+        #  T   f    The connection is about to abort.
+        #             Thread calling abort_connection() will take
+        #             responsibility to destroy self.socket (if set).
+        #             The worker thread releases control on self.socket (if set).
+
+        #  T   T    The connection is being destroyed by *another* abort_connection.
+        #             No work is needed by this call to abort_connection().
+
+        # If self.no_start is not set by someone, the thread must
+        # invoke next_chan.start() and return some single item to
+        # self.ret channel, to make counting of remaining workers
+        # consistent.
+
+        # If self.no_start is set, it implies the main thread is no
+        # more caring about the work counting, and the above
+        # consistent requirement is abandoned.
+
+        atomic = self.atomic_lock
+
+        with atomic:
             if self.no_start:
+                dp("{hs} not starting at all", hs=self.hs)
+                self.ret.put(None)
                 return
-            self.sock = socket.socket()
-            dp("{hs} start running", hs=self.hs)
+
+        dp("{hs} start running", hs=self.hs)
+        sock = socket.socket()
+
+        with atomic:
+            if self.no_start:
+                # small race on who to destroy the socket
+                sock.close()
+                self.ret.put(None)
+                return
+            self.sock = sock
+
+        try:
             if self.hs.wait or True:
                 # Timed wait with interruption: self.waitchan is used for interuupt.
                 dp("{hs} start waiting for {w} seconds", hs=self.hs, w=self.hs.wait)
@@ -82,15 +137,20 @@ Use Connector.get_fastest_connection().
                     dp("{hs} received cascade signal {r}", hs=self.hs, r=r)
                     if not r:
                         dp("{hs} requested connection cancel", hs=self.hs, r=r)
-                        self.no_start = True
+                        # False must be sent by self.abort_connection().
+                        assert(self.no_start == True)
                     else:
                         dp("{hs} requested connection early start", hs=self.hs, r=r)
                 except queue.Empty:
                     pass
+
+            with atomic:
+                if self.no_start:
+                    self.ret.put(None)
+                    return
+
             if self.nextchan:
                 self.nextchan.start()
-            if self.no_start:
-                return
 
             dp("{hs} wait finished starting", hs=self.hs)
             addr = socket.getaddrinfo(self.hs.host, self.hs.port,
@@ -108,47 +168,65 @@ Use Connector.get_fastest_connection().
                 remoteip = ipaddress.ip_address(addr[0])
                 local_if = ipaddress.ip_interface("%s/%d" % (laddr[0], self.hs.mask))
                 if remoteip not in local_if.network:
-                    raise RuntimeError("{} not in network {}".format(
+                    raise ConnectionAborted("{} not in network {}".format(
                         remoteip, local_if))
 
-            if self.no_start:
-                return
+            with atomic:
+                if self.no_start:
+                    self.ret.put(None)
+                    return
+
             dp("{hs} connecting", hs=self.hs)
             self.sock.connect(addr)
-            dp("{hs} connected", hs=self.hs)
-            self.msg.append("CONNECTED to {}:{}".format(self.hs.host, self.hs.port))
-            self.ret.put(self.sock)
-        except (RuntimeError, OSError) as e:
+
+            with atomic:
+                dp("{hs} connected", hs=self.hs)
+                self.msg.append("CONNECTED to {}:{}".format(self.hs.host, self.hs.port))
+                self.ret.put(self.sock)
+                return
+
+        except (ConnectionAborted, OSError) as e:
             dp("{hs} connection failed {e}", hs=self.hs, e=e)
-            if not self.no_start:
-                self.done = True
-                self.__ignore_os_error(self.sock.close)
-                m = "%s: connection failed\n%s\n" % (str(self.hs), traceback.format_exc())
-                self.diag.append(m)
+            do_close = False
+            with atomic:
+                if not self.no_start:
+                    self.done = True
+                    do_close = True
+
             if self.next_cascade:
                 self.nextchan.waitchan.put(True)
+
+            if do_close:
+                self.__ignore_os_error(self.sock.close)
+                m = "%s: connection failed: %s\n" % (str(self.hs), str(e))
+                self.diag.append(m)
+
             self.ret.put(None)
 
     def abort_connection(self):
         """abort connection attempts, racing with the running thread."""
-        dp("{hs} try aborting", hs=self.hs)
-        if self.done:
-            # someone (the runner or another call of abort_connection) is already taking care. No-op.
-            return
+        with self.atomic_lock:
+            if self.done:
+                dp("{hs} already terminated on abort request", hs=self.hs)
+                # someone (the runner or another call of abort_connection) is already taking care. No-op.
+                return
 
-        self.done = True
-        # 1. tell the runner that no more attempt needed.
-        self.no_start = True
-        # 2. if time-waiting, interrupt it.
-        self.waitchan.put(False)
-        # 3. if already start connecting, forcibly destroy the socket.
-        #    This will interrupt connect() call on pure Linux.
-        #    (not working on WSL, however.)
-        if self.sock:
-            dp("{hs} try shutdown", hs=self.hs)
-            self.__ignore_os_error(self.sock.shutdown, socket.SHUT_RDWR)
-            dp("{hs} try close", hs=self.hs)
-            self.__ignore_os_error(self.sock.close)
+            dp("{hs} try aborting", hs=self.hs)
+            self.done = True
+            # 1. tell the runner that no more attempt needed.
+            self.no_start = True
+            # 2. if time-waiting, interrupt it.
+            self.waitchan.put(False)
+            # 3. if already start connecting, forcibly destroy the socket.
+            #    This will interrupt connect() call on pure Linux with ECONNRESET.
+            #    (not working on Windows Subsystem for Linux, however.)
+            if not self.sock:
+                return
+
+        dp("{hs} try shutdown", hs=self.hs)
+        self.__ignore_os_error(self.sock.shutdown, socket.SHUT_RDWR)
+        dp("{hs} try close", hs=self.hs)
+        self.__ignore_os_error(self.sock.close)
 
     def register_as_next(self, next, cascade):
         assert(self.nextchan is None)
@@ -250,16 +328,14 @@ class Forwarder(Thread):
                     assert x > 0
                     l -= x
                     r = r[x:]
-        except OSError:
-            print("send failed", file=sys.stderr)
-            traceback.print_exc()
+        except OSError as e:
+            print("send failed: {e}".format(e=e), file=sys.stderr)
 
         if hasattr(self.to, "shutdown"):
             try:
                 self.to.shutdown(socket.SHUT_WR) # safer to use raw socket because of this
-            except OSError:
-                print("shutdown failed", file=sys.stderr)
-                traceback.print_exc()
+            except OSError as e:
+                print("shutdown failed: {e}".format(e=e), file=sys.stderr)
 
     @classmethod
     def run_parallel(klass, ff):
