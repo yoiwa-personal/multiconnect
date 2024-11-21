@@ -69,6 +69,7 @@ Use Connector.get_fastest_connection().
         self.nextchan = None
         self.next_cascade = False
         self.atomic_lock = threading.Lock()
+        self.started = False
         if prev:
             prev.register_as_next(self, cascade=hostspec.cascade)
 
@@ -108,6 +109,7 @@ Use Connector.get_fastest_connection().
         # If self.no_start is set, it implies the main thread is no
         # more caring about the work counting, and the above
         # consistent requirement is abandoned.
+        self.started = True
 
         atomic = self.atomic_lock
 
@@ -199,6 +201,7 @@ Use Connector.get_fastest_connection().
             if do_close:
                 self.__ignore_os_error(self.sock.close)
                 m = "%s: connection failed: %s\n" % (str(self.hs), str(e))
+                self.sock = None
                 self.diag.append(m)
 
             self.ret.put(None)
@@ -207,7 +210,7 @@ Use Connector.get_fastest_connection().
         """abort connection attempts, racing with the running thread."""
         with self.atomic_lock:
             if self.done:
-                dp("{hs} already terminated on abort request", hs=self.hs)
+                dp("{hs} already terminated", hs=self.hs)
                 # someone (the runner or another call of abort_connection) is already taking care. No-op.
                 return
 
@@ -217,16 +220,32 @@ Use Connector.get_fastest_connection().
             self.no_start = True
             # 2. if time-waiting, interrupt it.
             self.waitchan.put(False)
+
+            if not self.sock:
+                return
+
             # 3. if already start connecting, forcibly destroy the socket.
             #    This will interrupt connect() call on pure Linux with ECONNRESET.
             #    (not working on Windows Subsystem for Linux, however.)
-            if not self.sock:
-                return
 
         dp("{hs} try shutdown", hs=self.hs)
         self.__ignore_os_error(self.sock.shutdown, socket.SHUT_RDWR)
         dp("{hs} try close", hs=self.hs)
         self.__ignore_os_error(self.sock.close)
+        self.sock = None
+
+    def join_or_no_start(self, timeout=None):
+        """Wait for the thread to terminate.  If not started, prevent starting work any more."""
+        if not self.started:
+            # There will be a race between status check and join().
+            # Ensure the thread will not do any real work, even if it
+            # is started in a critical moment.  Thread.join() is not
+            # working well for EAFP-style atomic check.
+
+            self.abort_connection() # Set self.no_start = True, cause immediate return from run()
+
+        if self.started:
+            return self.join(timeout=timeout)
 
     def register_as_next(self, next, cascade):
         assert(self.nextchan is None)
@@ -270,10 +289,11 @@ Use Connector.get_fastest_connection().
         c = None
         o = None
         for hs in hosts:
-            dp("prev={o} hs={hs}", o=o, hs=hs)
+            dp("creating hs={hs} prev={o}", o=o, hs=hs)
             o = Connector(hs, q, msg, diag, prev=o)
             l.append(o)
 
+        dp("starting get_fastest_connection")
         l[0].start()
 
         left = len(l)
@@ -283,13 +303,17 @@ Use Connector.get_fastest_connection().
             if c:
                 break
 
+        dp("got a connection: {c}", c=c)
+
+        dp("aborting other workers")
         for x in reversed(l):
             if x.sock is not c:
                 x.abort_connection()
 
+        dp("joining workers")
         for x in l:
             try:
-                x.join(timeout=0.05)
+                x.join_or_no_start(timeout=0.05)
                 # If connection cancelling is not working, or
                 # connection attempt is blocked on DNS resolving,
                 # this join will block.  Ignore any error with
@@ -301,6 +325,8 @@ Use Connector.get_fastest_connection().
 
         msg = "\n".join(msg)
         diag = "\n".join(diag)
+
+        dp("done get_fastest_connection")
 
         return c, msg, diag
 
