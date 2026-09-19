@@ -7,328 +7,307 @@ multiconnect: A TCP proxy choosing fastest TCP/IP connection.
 # Redistributable under Apache License, version 2.0.
 # See <https://www.apache.org/licenses/LICENSE-2.0>
 
+from typing import Any, Callable, Coroutine, Optional, Set, Tuple
 import sys
+
+import asyncio
+import socket
+
 import threading
 from threading import Thread
+
 from collections import namedtuple
-import queue
-import socket
 import traceback
-import time
 import re
-import select
 import argparse
 
 _debug = False
 def dp(f, **k):
     if _debug:
+        if len(k):
+            f = f.format(**k)
         print(f.format(**k), file=sys.stderr)
 
-class HostSpec(namedtuple('HostSpec', ['wait', 'host', 'mask', 'port', 'cascade'])):
+def _print_to_stderr(*a, **k):
+    print(*a, **k, file=stderr)
+
+class HostSpec(namedtuple('HostSpec', ['wait', 'host', 'mask', 'port'])):
     def __str__(self):
-        c = "* " if self.cascade else ""
         w = ("%g:" % self.wait) if self.wait else ""
         m = ("/%d" % self.mask) if self.mask else ""
-        return "%s%s%s%s:%d" % (c, w, self.host, m, self.port)
+        return "%s%s%s:%d" % (w, self.host, m, self.port)
     def short_str(self):
         return "%s:%d" % (self.host, self.port)
 
-class ConnectionAborted(RuntimeError):
-    pass
+class TaskCoordinator:
+    """
+    Coordinator class for Parallel Racing Tasks
+    """
+    def __init__(self, clean_up_task = (lambda x: None)):
+        self.winner_result: Optional[Any] = None
+        self.winner_event = asyncio.Event()
+        self.winning_task = None
+        self.active_tasks: Set[asyncio.Task] = set()
+        self.clean_up_task = clean_up_task
 
-class Connector(Thread):
-    def __init__(self, hostspec, ret, msg, diag, prev):
+    def set_winner(self, result: Any, winning_task: asyncio.Task):
+        """Decide the winner, and cancel all other running tasks"""
+        if not self.winner_event.is_set():
+            self.winning_task = winning_task
+            self.winner_result = result
+            self.winner_event.set()
+            for task in list(self.active_tasks):
+                if task != winning_task and not task.done():
+                    task.cancel()
+
+    async def _cleanup_losers(self):
         """
-Tries to make an connection on background.
+        A helper to gather all remaining runners and reap it
+        """
+        loser_tasks = [t for t in list(self.active_tasks) if t != self.winning_task]
+        if not loser_tasks:
+            return
 
-Use Connector.get_fastest_connection().
-"""
-        # Initializer arguments:
-        #  - hostspec: see get_fastest_connection().
-        #  - ret (Queue):
-        #     a channel to send a result.
-        #     Possible messages to be sent are either a Socket or None.
-        #  - msg (appendable sequence):
-        #     a channel to gather a short diagnostic messages.
-        #  - diagmsg (appendable sequence):
-        #     a channel to gather an diagnostic messages.
-        #
-        # Instance variables for internal communications:
-        #   - .sock: socket on working.
-        #   - .no_start: if set to True from outside, the instance will not continue connecting.
-        #   - .done: set to True by itself, meaning that the socket is already closed.
-        super().__init__(daemon=True, name=repr(str(hostspec)))
-        self.hs = hostspec
-        self.ret = ret
-        self.msg = msg
-        self.diag = diag
-        self.sock = None
-        self.no_start = False
-        self.done = False
-        self.waitchan = queue.Queue()
-        self.nextchan = None
-        self.next_cascade = False
-        self.atomic_lock = threading.Lock()
-        self.started = False
-        if prev:
-            prev.register_as_next(self, cascade=hostspec.cascade)
+        # collect all remaining tasks
+        results = await asyncio.gather(*loser_tasks, return_exceptions=True)
 
-    def run(self):
-        # assignment to and status check on the following variables are
-        # protected by self.atomic_lock:
+        # call finalizer for any cleanup requirements
+        for res in results:
+            self.clean_up_task(res)
 
-        #   - self.no_start
-        #   - self.done
-        #   - self.socket
+    async def spawn(
+            self,
+            func: Coroutine[Any, Any, Any],
+            name : Optional[str] = None,
+            predecessor: Optional[asyncio.Task] = None,
+            delay: float = 0.0,
+    ) -> asyncio.Task:
+        """
+        Run a new task under the coordinator.
+        Wait until predecessor fails or delay seconds, whichever is faster.
+        """
+        loop = asyncio.get_running_loop()
+        if not name:
+            name = f"{func.__name__}"
 
-        # Combinations of self.no_start and self.done at status checking:
-        #  self.no_start,
-        #  |   self.done:
-
-        #  f   f    This thread is working.  Check no_start on next opportunity.
-
-        #  f   f    This thread is acquired a working remote connection.
-        #           (abort_connection() can still be called.)
-
-        #  f   T    This worker thread is failed to create a working connection.
-        #             This thread takes responsibility to destroy the socket.
-
-        #  T   f    The connection is about to abort.
-        #             Thread calling abort_connection() will take
-        #             responsibility to destroy self.socket (if set).
-        #             The worker thread releases control on self.socket (if set).
-
-        #  T   T    The connection is being destroyed by *another* abort_connection.
-        #             No work is needed by this call to abort_connection().
-
-        # If self.no_start is not set by someone, the thread must
-        # invoke next_chan.start() and return some single item to
-        # self.ret channel, to make counting of remaining workers
-        # consistent.
-
-        # If self.no_start is set, it implies the main thread is no
-        # more caring about the work counting, and the above
-        # consistent requirement is abandoned.
-        self.started = True
-
-        atomic = self.atomic_lock
-
-        with atomic:
-            if self.no_start:
-                dp("{hs} not starting at all", hs=self.hs)
-                self.ret.put(None)
+        if predecessor is not None:
+            try:
+                dp(f"{name}: waiting predecessor or {delay}...")
+                await asyncio.wait_for(asyncio.shield(predecessor), timeout=delay)
+                dp(f"{name}: waiting predecessor or {delay}... pred finised")
+            except asyncio.TimeoutError:
+                dp(f"{name}: waiting predecessor or {delay}... time elapsed")
+                pass
+            except asyncio.CancelledError:
+                dp(f"{name}: waiting predecessor or {delay}... CANCELLED")
+                func.close()
                 return
-
-        dp("{hs} start running", hs=self.hs)
-        sock = socket.socket()
-
-        with atomic:
-            if self.no_start:
-                # small race on who to destroy the socket
-                sock.close()
-                self.ret.put(None)
-                return
-            self.sock = sock
-
-        try:
-            if self.hs.wait or True:
-                # Timed wait with interruption: self.waitchan is used for interuupt.
-                dp("{hs} start waiting for {w} seconds", hs=self.hs, w=self.hs.wait)
-                try:
-                    r = self.waitchan.get(timeout=self.hs.wait)
-                    dp("{hs} received cascade signal {r}", hs=self.hs, r=r)
-                    if not r:
-                        dp("{hs} requested connection cancel", hs=self.hs, r=r)
-                        # False must be sent by self.abort_connection().
-                        assert(self.no_start == True)
-                    else:
-                        dp("{hs} requested connection early start", hs=self.hs, r=r)
-                except queue.Empty:
-                    pass
-
-            with atomic:
-                if self.no_start:
-                    self.ret.put(None)
-                    return
-
-            if self.nextchan:
-                self.nextchan.start()
-
-            dp("{hs} wait finished starting", hs=self.hs)
-            addr = socket.getaddrinfo(self.hs.host, self.hs.port,
-                                      family=socket.AF_INET,
-                                      proto=socket.IPPROTO_TCP)[0][4]
-
-            if self.hs.mask:
-                # Applying connect() to UDP socket will resolve routing and
-                # get an appropriate source address for reaching that destination.
-                import ipaddress
-                usock = socket.socket(type=socket.SOCK_DGRAM)
-                usock.connect(addr)
-                laddr = usock.getsockname()
-
-                remoteip = ipaddress.ip_address(addr[0])
-                local_if = ipaddress.ip_interface("%s/%d" % (laddr[0], self.hs.mask))
-                if remoteip not in local_if.network:
-                    raise ConnectionAborted("{} not in network {}".format(
-                        remoteip, local_if))
-
-            with atomic:
-                if self.no_start:
-                    self.ret.put(None)
-                    return
-
-            dp("{hs} connecting", hs=self.hs)
-            self.sock.connect(addr)
-
-            with atomic:
-                dp("{hs} connected", hs=self.hs)
-                self.msg.append("CONNECTED to {}:{}".format(self.hs.host, self.hs.port))
-                self.ret.put(self.sock)
-                return
-
-        except (ConnectionAborted, OSError) as e:
-            dp("{hs} connection failed {e}", hs=self.hs, e=e)
-            do_close = False
-            with atomic:
-                if not self.no_start:
-                    self.done = True
-                    do_close = True
-
-            if self.next_cascade:
-                self.nextchan.waitchan.put(True)
-
-            if do_close:
-                self.__ignore_os_error(self.sock.close)
-                m = "%s: connection failed: %s\n" % (str(self.hs), str(e))
-                self.sock = None
-                self.diag.append(m)
-
-            self.ret.put(None)
-
-    def abort_connection(self):
-        """abort connection attempts, racing with the running thread."""
-        with self.atomic_lock:
-            if self.done:
-                dp("{hs} already terminated", hs=self.hs)
-                # someone (the runner or another call of abort_connection) is already taking care. No-op.
-                return
-
-            dp("{hs} try aborting", hs=self.hs)
-            self.done = True
-            # 1. tell the runner that no more attempt needed.
-            self.no_start = True
-            # 2. if time-waiting, interrupt it.
-            self.waitchan.put(False)
-
-            if not self.sock:
-                return
-
-            # 3. if already start connecting, forcibly destroy the socket.
-            #    This will interrupt connect() call on pure Linux with ECONNRESET.
-            #    (not working on Windows Subsystem for Linux, however.)
-
-        dp("{hs} try shutdown", hs=self.hs)
-        self.__ignore_os_error(self.sock.shutdown, socket.SHUT_RDWR)
-        dp("{hs} try close", hs=self.hs)
-        self.__ignore_os_error(self.sock.close)
-        self.sock = None
-
-    def join_or_no_start(self, timeout=None):
-        """Wait for the thread to terminate.  If not started, prevent starting work any more."""
-        if not self.started:
-            # There will be a race between status check and join().
-            # Ensure the thread will not do any real work, even if it
-            # is started in a critical moment.  Thread.join() is not
-            # working well for EAFP-style atomic check.
-
-            self.abort_connection() # Set self.no_start = True, cause immediate return from run()
-
-        if self.started:
-            return self.join(timeout=timeout)
-
-    def register_as_next(self, next, cascade):
-        assert(self.nextchan is None)
-        self.nextchan = next
-        self.next_cascade = cascade
-
-    @staticmethod
-    def __ignore_os_error(f, *a, **ka):
-        try:
-            f(*a, **ka)
-        except OSError as e:
-            dp("... ignoring OS error {e}", e=e)
+            except Exception as e:
+                dp(f"{name}: waiting predecessor or {delay}... failed {e!r}")
+                pass
+        elif delay > 0.0:
+            dp(f"{name}: waiting {delay}...")
+            await asyncio.sleep(delay)
+            dp(f"{name}: time elapsed")
+        else:
+            dp(f"{name}: no waiting ...")
             pass
+
+        if self.winner_event.is_set():
+            func.close()
+            return
+
+        async def _wrapper():
+            current_task = asyncio.current_task()
+
+            # Run a task
+            try:
+                res = await func
+                if res is not None and not self.winner_event.is_set():
+                    self.set_winner(res, current_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"{name}: {e!r} {getattr(e,'traceback','')}", file=sys.stderr)
+        _wrapper.__name__ = func.__name__
+
+        task = loop.create_task(_wrapper())
+        self.active_tasks.add(task)
+        task.add_done_callback(lambda t: self.active_tasks.discard(t))
+        return task
+
+    async def run_until_complete(self) -> Any:
+        """Run tasks and wait a winner"""
+        while not self.winner_event.is_set() and self.active_tasks:
+            done, _ = await asyncio.wait(
+                self.active_tasks,
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            if self.winner_event.is_set():
+                break
+
+        if self.winner_event.is_set():
+            asyncio.create_task(self._cleanup_losers())
+            return self.winner_result
+        else:
+            return None
+
+class AsyncConnector:
+    @staticmethod
+    def _force_close_socket(sock: socket.socket):
+        """terminate socket by RST"""
+        try:
+            sock = writer.get_extra_info('socket')
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+            sock.close()
+        except Exception:
+            pass
+
+    def _looser_sentinel(res):
+        """terminate socket by RST"""
+        if (isinstance(res, tuple) and
+            isinstance(res[4], socket.socket)):
+            self._force_close_socket(res[4])
+
+    async def connect_singleip_worker(
+            self,
+            host: str,
+            port: int,
+            mask: Optional[int],
+            addr_info: tuple,
+            use_rst: bool = True
+    ):
+        loop = asyncio.get_running_loop()
+
+        family, type_, proto, _, sockaddr = addr_info
+        ip_str = sockaddr[0]
+        writer = None
+
+        if mask:
+            ok = None
+            if 0 < mask < 32:
+                # IPv4
+                if family != socket.AF_INET:
+                    ok = False
+            elif 32 <= mask <= 128:
+                if family != socket.AF_INET6:
+                    ok = False
+            else:
+                raise ValueError(f"invalid mask {mask}")
+            if ok != False:
+                import ipaddress
+                usock = socket.socket(type=socket.SOCK_DGRAM, family=family)
+                usock.connect((addr_info[4][0], 80)) # port is dummy
+                laddr = usock.getsockname()
+                remoteip = ipaddress.ip_address(addr_info[4][0])
+                local_if = ipaddress.ip_interface("%s/%d" % (laddr[0], mask))
+                if remoteip not in local_if.network:
+                    self.diag_f(f"{remoteip} not in network {local_if}")
+                else:
+                    ok = True
+                usock.close()
+            if not ok:
+                return None
+
+        try:
+            dp("Connecting to {host}:{port}", host=host, port=port)
+
+            sock = socket.socket(family, socket.SOCK_STREAM, proto=proto)
+            sock.setblocking(False)
+
+            try:
+                await loop.sock_connect(sock, (host, port))
+                sock.setblocking(True)
+            except:
+                sock.close()
+                raise
+
+            self.msg_f(f"CONNECTED to {host}:{port}")
+            return sock
+        except asyncio.CancelledError:
+            self._force_close_socket(sock)
+            raise
+        except OSError as e:
+            self.diag_f(f"{host}:{port}: {e!r}")
+            self._force_close_socket(sock)
+            return None
+
+    async def host_happy_eyeballs_worker(
+            self,
+            host: str,
+            port: int,
+            mask: int,
+            happy_eyeballs_delay: float = 0.25
+    ):
+        loop = asyncio.get_running_loop()
+
+        infos = await loop.getaddrinfo(
+            host, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
+        )
+
+        v6_addrs = [i for i in infos if i[0] == socket.AF_INET6]
+        v4_addrs = [i for i in infos if i[0] == socket.AF_INET]
+
+        ordered_addrs = []
+        for idx in range(max(len(v6_addrs), len(v4_addrs))):
+            if idx < len(v6_addrs):
+                ordered_addrs.append(v6_addrs[idx])
+            if idx < len(v4_addrs):
+                ordered_addrs.append(v4_addrs[idx])
+
+        if not ordered_addrs:
+            self.diag_v("connection to {host} failed: no useable destination IP")
+            return None
+
+        prev_ip_task = None
+
+        for i, addr in enumerate(ordered_addrs):
+            delay = 0.0 if i == 0 else happy_eyeballs_delay
+            host = addr[4][0]
+            port = addr[4][1]
+            new_task = await self.coord.spawn(
+                self.connect_singleip_worker(host=host, port=port, mask=mask, addr_info=addr),
+                predecessor=prev_ip_task,
+                delay=delay,
+                name=f"{host}:{port}"
+            )
+            if not new_task: break
+            new_task.name = f"<singleip_worker: {host}:{port}>"
+            prev_ip_task = new_task
+
+        if prev_ip_task: # may be cancelled during waiting
+            dp(f"connection to {host}: waiting for last single_ip: {prev_ip_task.name}")
+            await asyncio.wait([prev_ip_task])
+            dp(f"connection to {host}: waiting for {prev_ip_task.name} done. finishing")
+
+    async def async_get_fastest_connection(self, hosts, msg=None, diag=None):
+        self.coord = coord = TaskCoordinator(clean_up_task=self._looser_sentinel)
+        msg_v = []
+        diag_v = []
+        if not msg:
+            self.msg_f = msg_v.append
+        if not diag:
+            self.diag_f = diag_v.append
+
+        prev_task = None
+        for i, hostspec in enumerate(hosts):
+            (wait, host, mask, port) = hostspec
+            prev_task = await coord.spawn(
+                self.host_happy_eyeballs_worker(
+                    hostspec.host, hostspec.port, hostspec.mask),
+                name = f"{i}:{hostspec!s}",
+                delay=hostspec.wait, predecessor=prev_task)
+            if not prev_task: break
+
+        result = await coord.run_until_complete()
+        msg = "\n".join(msg_v)
+        diag = "\n".join(diag_v)
+
+        return result, msg, diag
 
     @classmethod
     def get_fastest_connection(klass, hosts):
-        """
-    Try simultanously connecting to given host lists and return the fastest one.
-
-    Argument is a list of HostSpec's containing the following fields:
-
-      - wait (real): seconds to delay connections.
-
-      - host (string): a target host name or an IPv4 address to connect.
-
-      - mask (optional integer):
-        a number of bits for IPv4 netmask.
-        If the target host does not belong to the same network as the running host,
-        the connection will not be attempted.
-
-      - port (integer): a TCP port number to connect.
-
-    Returning a tuple of (c, m, dg), where
-      - c is a connected TCP socket channel or None,
-      - m, dg is a string containing message and diagnostic messages.
-"""
-        q = queue.Queue()
-        msg = []
-        diag = []
-        l = []
-        c = None
-        o = None
-        for hs in hosts:
-            dp("creating hs={hs} prev={o}", o=o, hs=hs)
-            o = Connector(hs, q, msg, diag, prev=o)
-            l.append(o)
-
-        dp("starting get_fastest_connection")
-        l[0].start()
-
-        left = len(l)
-        while (left > 0):
-            c = q.get()
-            left -= 1
-            if c:
-                break
-
-        dp("got a connection: {c}", c=c)
-
-        dp("aborting other workers")
-        for x in reversed(l):
-            if x.sock is not c:
-                x.abort_connection()
-
-        dp("joining workers")
-        for x in l:
-            try:
-                x.join_or_no_start(timeout=0.05)
-                # If connection cancelling is not working, or
-                # connection attempt is blocked on DNS resolving,
-                # this join will block.  Ignore any error with
-                # a tiny waiting allowance.
-                if x.is_alive():
-                    dp("debug oops: {x} still alive.  ignoring.", x=x)
-            except RuntimeError:
-                pass
-
-        msg = "\n".join(msg)
-        diag = "\n".join(diag)
-
-        dp("done get_fastest_connection")
-
-        return c, msg, diag
+        return asyncio.run(klass().async_get_fastest_connection(hosts))
 
 bufsize = 1048576
 class Forwarder(Thread):
@@ -437,7 +416,7 @@ after waiting a half second.
         _debug = True
 
     for hspec in args.hosts:
-        mo = re.match(r"^((?P<cascade>[-*])?(?P<wait>\d+(\.\d+)?):)?(?P<host>[^/:]+)(/(?P<mask>\d+))?:(?P<port>\d+)$", hspec)
+        mo = re.match(r"^((?P<wait>\d+(\.\d+)?):)?(?P<host>[^/:]+)(/(?P<mask>\d+))?:(?P<port>\d+)$", hspec)
         if not mo:
             raise RuntimeError("bad spec: {}".format(hspec))
         w = mo.group('wait')
@@ -446,10 +425,9 @@ after waiting a half second.
         nm = mo.group('mask')
         nm = int(nm) if nm else None
         p = int(mo.group('port'))
-        c = mo.group('cascade') is None
-        hostlist.append(HostSpec(wait = w, host = h, mask = nm, port = p, cascade=c))
+        hostlist.append(HostSpec(wait = w, host = h, mask = nm, port = p))
 
-    c, msg, diag = Connector.get_fastest_connection(hostlist)
+    c, msg, diag = AsyncConnector.get_fastest_connection(hostlist)
 
     if not c:
         print("cannot connect to any given host.", file=sys.stderr)
@@ -461,7 +439,7 @@ after waiting a half second.
         print(msg, file=sys.stderr)
         if args.verbose >= 2:
             print(diag, file=sys.stderr)
-    
+
     Forwarder.run_parallel(
         ((c, sys.stdout.buffer.raw),
          (sys.stdin.buffer.raw, c)))
