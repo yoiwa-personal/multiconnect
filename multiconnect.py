@@ -209,8 +209,7 @@ class AsyncConnector:
 
         try:
             dp("Connecting to {host}:{port}", host=host, port=port)
-
-            sock = socket.socket(family, socket.SOCK_STREAM, proto=proto)
+            sock = socket.socket(family=family, type=socket.SOCK_STREAM, proto=proto)
             sock.setblocking(False)
 
             try:
@@ -226,7 +225,7 @@ class AsyncConnector:
             self._force_close_socket(sock)
             raise
         except OSError as e:
-            self.diag_f(f"{host}:{port}: {e!r}")
+            self.diag_f(f"{host}:{port}: connection failed {e!r}")
             self._force_close_socket(sock)
             return None
 
@@ -441,12 +440,12 @@ after waiting a half second.
         _debug = True
 
     for hspec in args.hosts:
-        mo = re.match(r"^((?P<wait>\d+(\.\d+)?):)?(?P<host>[^/:]+)(/(?P<mask>\d+))?:(?P<port>\d+)$", hspec)
+        mo = re.match(r"^((?P<wait>\d+(\.\d+)?):)?(\[(?P<host6>[0-9A-Fa-f:]+)\]|(?P<host>[^/:]+))(/(?P<mask>\d+))?:(?P<port>\d+)$", hspec)
         if not mo:
             raise RuntimeError("bad spec: {}".format(hspec))
         w = mo.group('wait')
         w = float(w) if w else 0.0
-        h = mo.group('host')
+        h = mo.group('host') or mo.group('host6')
         nm = mo.group('mask')
         nm = int(nm) if nm else None
         p = int(mo.group('port'))
