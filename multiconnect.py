@@ -157,7 +157,6 @@ class AsyncConnector:
     def _force_close_socket(sock: socket.socket):
         """terminate socket by RST"""
         try:
-            sock = writer.get_extra_info('socket')
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
             sock.close()
         except Exception:
@@ -165,9 +164,8 @@ class AsyncConnector:
 
     def _looser_sentinel(res):
         """terminate socket by RST"""
-        if (isinstance(res, tuple) and
-            isinstance(res[4], socket.socket)):
-            self._force_close_socket(res[4])
+        if res is not None:
+            self._force_close_socket(res)
 
     async def connect_singleip_worker(
             self,
@@ -216,7 +214,7 @@ class AsyncConnector:
             sock.setblocking(False)
 
             try:
-                await loop.sock_connect(sock, (host, port))
+                await loop.sock_connect(sock, sockaddr)
                 sock.setblocking(True)
             except:
                 sock.close()
@@ -281,6 +279,7 @@ class AsyncConnector:
             dp(f"connection to {host}: waiting for {prev_ip_task.name} done. finishing")
 
     async def async_get_fastest_connection(self, hosts, msg=None, diag=None):
+        """The main coroutine of get_fastest_connection. Use get_fastest_connection below."""
         self.coord = coord = TaskCoordinator(clean_up_task=self._looser_sentinel)
         msg_v = []
         diag_v = []
@@ -306,8 +305,34 @@ class AsyncConnector:
         return result, msg, diag
 
     @classmethod
-    def get_fastest_connection(klass, hosts):
-        return asyncio.run(klass().async_get_fastest_connection(hosts))
+    def get_fastest_connection(klass, hosts, msg=None, diag=None):
+        """Try simultanously connecting to given host lists and return the fastest one.
+
+Argument is a list of HostSpec's containing the following fields:
+
+  - wait (real): seconds to delay connections.
+
+  - host (string): a target host name or an IPv4 address to connect.
+
+  - mask (optional integer):
+    a number of bits for IPv4 netmask.
+    If the target host does not belong to the same network as the running host,
+    the connection will not be attempted.
+
+  - port (integer): a TCP port number to connect.
+
+Optional msg and diag are functions receiving a progress and
+diagnostic messages during running.  If omitted, these will
+be returned in the return values msg and diag below.
+
+Returning a tuple of (c, msg, diag), where
+  - c is a connected TCP socket channel or None,
+  - msg, diag is a string containing message and diagnostic messages.
+"""
+        return asyncio.run(klass().async_get_fastest_connection(hosts, msg, diag))
+
+### Bidirectional data forwarding (proxying).
+### For optimal throughput, it is implemented as a threaded routine, not coroutines.
 
 bufsize = 1048576
 class Forwarder(Thread):
