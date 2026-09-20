@@ -31,17 +31,20 @@ def dp(f, **k):
 def _print_to_stderr(*a, **k):
     print(*a, **k, file=stderr)
 
-class HostSpec(namedtuple('HostSpec', ['wait', 'host', 'mask', 'port'])):
+class HostSpec(namedtuple('HostSpec', ['host', 'port', 'mask', 'wait', 'family'])):
     def __str__(self):
         w = ("%g:" % self.wait) if self.wait else ""
+        f = "" if self.family == None else "[V%sONLY] " % self.family
+        h = self.host
+        h = "[" + h + "]" if ":" in h else h
         m = ("/%d" % self.mask) if self.mask else ""
-        return "%s%s%s:%d" % (w, self.host, m, self.port)
+        return "%s%s%s%s:%d" % (w, f, h, m, self.port)
     def short_str(self):
         return "%s:%d" % (self.host, self.port)
 
 class TaskCoordinator:
     """
-    Coordinator class for Parallel Racing Tasks
+    Generic Coordinator class for Parallel Racing Tasks
     """
     def __init__(self, clean_up_task = (lambda x: None)):
         self.winner_result: Optional[Any] = None
@@ -102,8 +105,12 @@ class TaskCoordinator:
                 dp(f"{name}: waiting predecessor or {delay}... CANCELLED")
                 func.close()
                 return
+            except OSError as e:
+                dp(f"{name}: waiting predecessor or {delay}... failed {e!r}")
+                pass
             except Exception as e:
                 dp(f"{name}: waiting predecessor or {delay}... failed {e!r}")
+                traceback.print_exception(e)
                 pass
         elif delay > 0.0:
             dp(f"{name}: waiting {delay}...")
@@ -127,11 +134,16 @@ class TaskCoordinator:
                     self.set_winner(res, current_task)
             except asyncio.CancelledError:
                 raise
+            except OSError as e:
+                print(f"{name}: {e!r}", file=sys.stderr)
             except Exception as e:
-                print(f"{name}: {e!r} {getattr(e,'traceback','')}", file=sys.stderr)
+                print(f"{name}: {e!r}", file=sys.stderr)
+                traceback.print_exception(e)
+            return None
+
         _wrapper.__name__ = func.__name__
 
-        task = loop.create_task(_wrapper())
+        task = loop.create_task(_wrapper(), name=name)
         self.active_tasks.add(task)
         task.add_done_callback(lambda t: self.active_tasks.discard(t))
         return task
@@ -153,9 +165,14 @@ class TaskCoordinator:
             return None
 
 class AsyncConnector:
+    """Socket connector to find the fastest-available connection among parallel attempts.
+
+    No instance to create by users: See the class method `get_fastest_connection`.
+    """
+
     @staticmethod
     def _force_close_socket(sock: socket.socket):
-        """terminate socket by RST"""
+        """terminate a socket by RST"""
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
             sock.close()
@@ -163,21 +180,19 @@ class AsyncConnector:
             pass
 
     def _looser_sentinel(res):
-        """terminate socket by RST"""
+        """Call-back for every returned but not selected results."""
         if res is not None:
             self._force_close_socket(res)
 
     async def connect_singleip_worker(
             self,
-            host: str,
-            port: int,
-            mask: Optional[int],
             addr_info: tuple,
-            use_rst: bool = True
+            mask: Optional[int],
+            worker_id: str
     ):
         loop = asyncio.get_running_loop()
 
-        family, type_, proto, _, sockaddr = addr_info
+        family, type_, proto, canonname, sockaddr = addr_info
         ip_str = sockaddr[0]
         writer = None
 
@@ -194,21 +209,29 @@ class AsyncConnector:
                 raise ValueError(f"invalid mask {mask}")
             if ok != False:
                 import ipaddress
-                usock = socket.socket(type=socket.SOCK_DGRAM, family=family)
-                usock.connect((addr_info[4][0], 80)) # port is dummy
-                laddr = usock.getsockname()
+                # use UDP connect (externally no-op) to discover the source address after routing
+                uaddr = list(addr_info[4])
+                uaddr[1] = 80 # dummy port number to something legitimate
+                uaddr = tuple(uaddr)
+                usock = socket.socket(type=socket.SOCK_DGRAM, family=family, proto=socket.IPPROTO_UDP)
+                usock.connect(uaddr)
+                laddr = usock.getsockname() # get local-side address
+                usock.close()
                 remoteip = ipaddress.ip_address(addr_info[4][0])
                 local_if = ipaddress.ip_interface("%s/%d" % (laddr[0], mask))
                 if remoteip not in local_if.network:
-                    self.diag_f(f"{remoteip} not in network {local_if}")
+                    self.diag_f(f"{worker_id}: {remoteip} not in network {local_if}")
                 else:
                     ok = True
-                usock.close()
             if not ok:
                 return None
 
+        hostport = [addr_info[4][0], addr_info[4][1]] # for diag message purposes
+        if family == socket.AF_INET6: hostport[0] = "[" + hostport[0] + "]"
+        hostport = hostport[0] + ":" + str(hostport[1])
+
         try:
-            dp("Connecting to {host}:{port}", host=host, port=port)
+            dp("Connecting to {hostport}", hostport=hostport)
             sock = socket.socket(family=family, type=socket.SOCK_STREAM, proto=proto)
             sock.setblocking(False)
 
@@ -219,31 +242,35 @@ class AsyncConnector:
                 sock.close()
                 raise
 
-            self.msg_f(f"CONNECTED to {host}:{port}")
+            self.msg_f(f"CONNECTED to {hostport}")
             return sock
         except asyncio.CancelledError:
             self._force_close_socket(sock)
             raise
         except OSError as e:
-            self.diag_f(f"{host}:{port}: connection failed {e!r}")
+            self.diag_f(f"{hostport}: connection failed {e!r}")
             self._force_close_socket(sock)
             return None
 
     async def host_happy_eyeballs_worker(
             self,
-            host: str,
-            port: int,
-            mask: int,
-            happy_eyeballs_delay: float = 0.25
+            hostspec,
+            worker_id: str,
     ):
+        """Worker coroutine for a single DNS-named host.
+        Spawn sub-coroutine for IP addresses among several IP addresses."""
+
+        our_use_v6 = self.use_v6 and hostspec.family != "4"
+        our_use_v4 = self.use_v4 and hostspec.family != "6"
+
         loop = asyncio.get_running_loop()
 
         infos = await loop.getaddrinfo(
-            host, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
+            hostspec.host, hostspec.port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
         )
 
-        v6_addrs = [i for i in infos if i[0] == socket.AF_INET6]
-        v4_addrs = [i for i in infos if i[0] == socket.AF_INET]
+        v6_addrs = [i for i in infos if i[0] == socket.AF_INET6] if our_use_v6 else []
+        v4_addrs = [i for i in infos if i[0] == socket.AF_INET] if our_use_v4 else []
 
         ordered_addrs = []
         for idx in range(max(len(v6_addrs), len(v4_addrs))):
@@ -253,58 +280,63 @@ class AsyncConnector:
                 ordered_addrs.append(v4_addrs[idx])
 
         if not ordered_addrs:
-            self.diag_v("connection to {host} failed: no useable destination IP")
+            self.diag_v("{worker_id}: connection to {host} failed: no useable destination IP")
             return None
 
         prev_ip_task = None
 
         for i, addr in enumerate(ordered_addrs):
-            delay = 0.0 if i == 0 else happy_eyeballs_delay
+            delay = 0.0 if i == 0 else self.happy_eyeballs_delay
             host = addr[4][0]
             port = addr[4][1]
+            nwi = f"{worker_id}-{i!s}"
             new_task = await self.coord.spawn(
-                self.connect_singleip_worker(host=host, port=port, mask=mask, addr_info=addr),
+                self.connect_singleip_worker(mask=hostspec.mask, addr_info=addr, worker_id=nwi),
                 predecessor=prev_ip_task,
                 delay=delay,
-                name=f"{host}:{port}"
+                name=f"{nwi}:: {host}:{port}"
             )
-            if not new_task: break
-            new_task.name = f"<singleip_worker: {host}:{port}>"
             prev_ip_task = new_task
+            if not new_task: break # Task cancelled
 
         if prev_ip_task: # may be cancelled during waiting
-            dp(f"connection to {host}: waiting for last single_ip: {prev_ip_task.name}")
+            dp(f"connection to {host}: waiting for finising last single_ip: task {prev_ip_task.get_name()}")
             await asyncio.wait([prev_ip_task])
-            dp(f"connection to {host}: waiting for {prev_ip_task.name} done. finishing")
+            dp(f"connection to {host}: waiting for task {prev_ip_task.get_name()} done. finishing")
 
-    async def async_get_fastest_connection(self, hosts, msg=None, diag=None):
+    async def async_get_fastest_connection(self, hosts):
         """The main coroutine of get_fastest_connection. Use get_fastest_connection below."""
         self.coord = coord = TaskCoordinator(clean_up_task=self._looser_sentinel)
-        msg_v = []
-        diag_v = []
-        if not msg:
-            self.msg_f = msg_v.append
-        if not diag:
-            self.diag_f = diag_v.append
 
         prev_task = None
         for i, hostspec in enumerate(hosts):
-            (wait, host, mask, port) = hostspec
             prev_task = await coord.spawn(
                 self.host_happy_eyeballs_worker(
-                    hostspec.host, hostspec.port, hostspec.mask),
-                name = f"{i}:{hostspec!s}",
+                    hostspec,
+                    worker_id=f"{i!s}"),
+                name = f"{i}:: {hostspec!s}",
                 delay=hostspec.wait, predecessor=prev_task)
             if not prev_task: break
 
         result = await coord.run_until_complete()
-        msg = "\n".join(msg_v)
-        diag = "\n".join(diag_v)
 
+        msg = "\n".join(self.msg_v)
+        diag = "\n".join(self.diag_v)
         return result, msg, diag
 
+    def __init__(self, msg=None, diag=None, use_v4=True, use_v6=True,
+                 happy_eyeballs_delay=0.25):
+        """ONLY called from get_fastest_connection"""
+        self.use_v4 = use_v4
+        self.use_v6 = use_v6
+        self.happy_eyeballs_delay = happy_eyeballs_delay
+        self.msg_v = []
+        self.diag_v = []
+        self.msg_f = msg if msg else self.msg_v.append
+        self.diag_f = diag if diag else self.diag_v.append
+
     @classmethod
-    def get_fastest_connection(klass, hosts, msg=None, diag=None):
+    def get_fastest_connection(klass, hosts, **k):
         """Try simultanously connecting to given host lists and return the fastest one.
 
 Argument is a list of HostSpec's containing the following fields:
@@ -328,7 +360,8 @@ Returning a tuple of (c, msg, diag), where
   - c is a connected TCP socket channel or None,
   - msg, diag is a string containing message and diagnostic messages.
 """
-        return asyncio.run(klass().async_get_fastest_connection(hosts, msg, diag))
+        return asyncio.run(klass(**k).
+                           async_get_fastest_connection(hosts))
 
 ### Bidirectional data forwarding (proxying).
 ### For optimal throughput, it is implemented as a threaded routine, not coroutines.
@@ -364,7 +397,8 @@ class Forwarder(Thread):
             try:
                 self.to.shutdown(socket.SHUT_WR) # safer to use raw socket because of this
             except OSError as e:
-                print("shutdown failed: {e}".format(e=e), file=sys.stderr)
+                #print("shutdown failed: {e}".format(e=e), file=sys.stderr)
+                pass
 
     @classmethod
     def run_parallel(klass, ff):
@@ -425,22 +459,33 @@ after waiting a half second.
     )
     parser.add_argument('hosts', metavar='hostspec', type=str, nargs='+',
                         help="connection destination candidates")
+    parser.add_argument('-4', '--use-v4-only', action='store_true',
+                        help="use IPv4 addresses only")
+    parser.add_argument('-6', '--use-v6-only', action='store_true',
+                        help="use IPv6 addresses only")
     parser.add_argument('-v', '--verbose', action='count', default=1,
                         help="increse verbosity level")
+    parser.add_argument('--delay', '--happy-eyeballs-delay', type=float, default=0.25,
+                        help="delay period multiple IP address (default 0.25 sec)")
     parser.add_argument('-q', '--quiet', action='store_const', dest='verbose', const=0,
                         help="set verbosity level to 0")
 
     args = parser.parse_args()
 
-#    if len(args.hosts) == 0:
-#        parser.print_help()
-#        sys.exit(2)
     global _debug
     if args.verbose >= 3:
         _debug = True
 
+    if args.use_v4_only and args.use_v6_only:
+        sys.stderr.write("Error: --use_v6_only and --use_v4_only is exclusive\n")
+        parser.print_help()
+        sys.exit(2)
+
+    use_v6 = not args.use_v4_only
+    use_v4 = not args.use_v6_only
+
     for hspec in args.hosts:
-        mo = re.match(r"^((?P<wait>\d+(\.\d+)?):)?(\[(?P<host6>[0-9A-Fa-f:]+)\]|(?P<host>[^/:]+))(/(?P<mask>\d+))?:(?P<port>\d+)$", hspec)
+        mo = re.match(r"^((?P<wait>\d+(\.\d+)?):)?(?:[vV](?P<family>[46]):)?(\[(?P<host6>[0-9A-Fa-f:]+)\]|(?P<host>[^/:]+))(/(?P<mask>\d+))?:(?P<port>\d+)$", hspec)
         if not mo:
             raise RuntimeError("bad spec: {}".format(hspec))
         w = mo.group('wait')
@@ -449,9 +494,15 @@ after waiting a half second.
         nm = mo.group('mask')
         nm = int(nm) if nm else None
         p = int(mo.group('port'))
-        hostlist.append(HostSpec(wait = w, host = h, mask = nm, port = p))
+        family = mo.group('family')
+        hostlist.append(HostSpec(wait = w, family=family, host = h, mask = nm, port = p))
 
-    c, msg, diag = AsyncConnector.get_fastest_connection(hostlist)
+    c, msg, diag = AsyncConnector.get_fastest_connection(
+        hostlist,
+        use_v4=use_v4,
+        use_v6=use_v6,
+        happy_eyeballs_delay=args.delay
+    )
 
     if not c:
         print("cannot connect to any given host.", file=sys.stderr)
