@@ -2,7 +2,7 @@
 """
 multiconnect: A TCP proxy choosing fastest TCP/IP connection.
 """
-# (c) 2018-2021 Yutaka OIWA <yutaka@oiwa.jp>.
+# (c) 2018-2026 Yutaka OIWA <yutaka@oiwa.jp>.
 # All rights reserved.
 # Redistributable under Apache License, version 2.0.
 # See <https://www.apache.org/licenses/LICENSE-2.0>

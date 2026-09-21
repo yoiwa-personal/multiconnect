@@ -127,7 +127,7 @@ cmd /c %%USERPROFILE%%\\libexec\\multiconnect.py 192.168.1.80/24:22 0.5:primary-
 
 ## Copyright and License
 
-Copyright 2019-2026 Yutaka OIWA <yutaka@oiwa.jp>
+Copyright 2018-2026 Yutaka OIWA <yutaka@oiwa.jp>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
