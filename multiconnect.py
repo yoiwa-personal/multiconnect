@@ -510,6 +510,7 @@ attempt for this spec is skipped.
             print(diag, file=sys.stderr)
 
     c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    c.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
     Forwarder.run_parallel(
         ((c, sys.stdout.buffer.raw),
