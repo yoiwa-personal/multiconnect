@@ -49,12 +49,12 @@ Literal IPv6 addresses containing colons must be enclosed in square brackets (e.
 
 You can customize the connection behavior using the following modifiers:
 
-* **`<delay>:`** 
+* **`<delay>`**: 
   Specifies a delay in seconds (e.g., `0.5`) before attempting to connect to this host. This allows preceding hosts in the list to be prioritized.
   If a connection attempt to a preceding host fails before the delay expires, the remaining delay is skipped, and the connection attempt to the next host starts immediately.
-* **`<protocol>:`** 
+* **`<protocol>`**: 
   Prefix with `v4:` or `v6:` to restrict the connection to a specific IP version.
-* **`/<mask_bits>:`** 
+* **`/<mask_bits>`**: 
   Specifies the subnet mask bits (IPv4 or IPv6) for the expected local network. The script will check if the resolved destination IP address falls within the local network defined by this mask. If it does not match, the connection attempt for this spec is skipped.
 
 ### Global Options
@@ -113,7 +113,7 @@ You can configure PuTTY to use `multiconnect` as a local proxy.
 2. Select **Local** as the **Proxy type**.
 3. In the **Proxy hostname** or **Telnet command, or local proxy command** field, enter the command line exactly as shown below.
 
-Due to PuTTY's internal parsing rules, backslashes and percent signs must be doubled (`\\`) to correctly pass environment variables. The examples below are already formatted for PuTTY; **copy and paste them exactly as they are**.
+Due to PuTTY's internal parsing rules, backslashes and percent signs must be doubled (`\\` and `%%`) to correctly pass command lines.
 
 * **Using an absolute path:**
 ```text
