@@ -12,7 +12,7 @@
 ## Typical Use Cases
 
 * **Optimizing Dual-Stack Connectivity:** Prioritizing IPv6 paths while maintaining a fast fallback to IPv4 for dual-stack hosts.
-* **Handling Split-Horizon DNS and Hairpin NAT:** Useful when a target server sits behind a NAPT firewall or reverse proxy. By using the *subnet-aware filtering* feature, the client can list both private and public target addresses; it will automatically skip public address attempts when inside the private network (avoiding hairpin NAT issues) and vice versa.
+* **Handling Split-Horizon DNS and Hairpin NAT:** Useful when a target server sits behind a NAPT firewall or reverse proxy. By using the *subnet-aware filtering* feature, the client can list both private and public target addresses; it will automatically skip private address attempts when outside the private network, and still prioritize the direct connection inside the private network (avoiding hairpin NAT issues).
 * **Supporting Legacy Clients:** Allowing older applications or clients that lack native IPv6 capabilities to connect to modern dual-stack or IPv6-only network environments via this proxy.
 * **Preference-Based Multi-Routing:** Defining a strict priority order among multiple backup destinations by introducing custom connection delays.
 
