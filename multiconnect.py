@@ -97,7 +97,7 @@ class TaskCoordinator:
             try:
                 dp(f"{name}: waiting predecessor or {delay}...")
                 await asyncio.wait_for(asyncio.shield(predecessor), timeout=delay)
-                dp(f"{name}: waiting predecessor or {delay}... pred finised")
+                dp(f"{name}: waiting predecessor or {delay}... pred finished")
             except asyncio.TimeoutError:
                 dp(f"{name}: waiting predecessor or {delay}... time elapsed")
                 pass
@@ -433,42 +433,36 @@ def main():
     hostlist = []
 
     parser = argparse.ArgumentParser(
-        description = "TCP proxy choosing the fastest connection from destination candidates.",
-        epilog="""Syntax for each hostspec is "[<delay>:]<host>[/<mask>]:<port>".
+        description = "A TCP proxy that chooses the first available connection from multiple destination candidates.",
+        epilog="""'Host' can be a DNS hostname, an IPv4 address, or an IPv6 address enclosed in [ ].
 
-It can be as simple as "host:port" (e.g. "example.com:22"), or
-as complex as "0.5:192.0.2.45/24:443".
+'delay' specifies a delay in seconds (e.g., `0.5`) before attempting
+to connect to this host, to allow preceding hosts in the list to be
+prioritized.  If a connection attempt to a preceding host fails before
+the delay expires, the remaining delay is skipped.
 
-If an optional floating-number prefix <delay> is given, connection is
-attempted after the given second is passed since the connection
-attempt for the previous argument is started.  The delay is cancelled
-if previous argument's connection is determined to be failed.
+'protocol' can be either 'v4' or 'v6' to restrict the connection to a specific IP version.
 
-The optional <mask> specifies the number of netmask bits for the
-expected local network.  If the destination IP address does not fall
-into the same network of this host, as determined by the mask bits,
-connection will not be tried.
-
-The above example means that if the current host is in 192.2.50.0/24
-network, try connecting to IPv4 address 192.0.2.45, TCP port 443,
-after waiting a half second.
-
+'mask_bits' specifies the subnet mask bits (IPv4 or IPv6) for the
+expected local network.  If the resolved destination IP address does
+not fall within the local network defined by this mask, the connection
+attempt for this spec is skipped.
 
 """,
         formatter_class=ParagraphFillingFormatter #argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument('hosts', metavar='hostspec', type=str, nargs='+',
-                        help="connection destination candidates")
+                        help="Connection destination candidates (syntax: '[delay:][protocol:]host[/mask_bits]:port').")
     parser.add_argument('-4', '--use-v4-only', action='store_true',
-                        help="use IPv4 addresses only")
+                        help="Force the use of IPv4 addresses only.")
     parser.add_argument('-6', '--use-v6-only', action='store_true',
-                        help="use IPv6 addresses only")
+                        help="Force the use of IPv6 addresses only.")
     parser.add_argument('-v', '--verbose', action='count', default=1,
-                        help="increse verbosity level")
+                        help="Increse verbosity level for diagnostics")
     parser.add_argument('--delay', '--happy-eyeballs-delay', type=float, default=0.25,
-                        help="delay period multiple IP address (default 0.25 sec)")
+                        help="Staggered delay period (in seconds) between multiple IP address attempts (default: 0.25)")
     parser.add_argument('-q', '--quiet', action='store_const', dest='verbose', const=0,
-                        help="set verbosity level to 0")
+                        help="Suppress progress/diagnostic messages")
 
     args = parser.parse_args()
 
@@ -514,6 +508,8 @@ after waiting a half second.
         print(msg, file=sys.stderr)
         if args.verbose >= 2:
             print(diag, file=sys.stderr)
+
+    c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     Forwarder.run_parallel(
         ((c, sys.stdout.buffer.raw),
