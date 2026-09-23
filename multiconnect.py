@@ -8,7 +8,7 @@ multiconnect: A TCP proxy choosing fastest TCP/IP connection.
 # See <https://www.apache.org/licenses/LICENSE-2.0>
 
 from typing import Any, Callable, Coroutine, Optional, Set, Tuple
-import sys
+import sys, os
 
 import asyncio
 import socket
@@ -110,7 +110,7 @@ class TaskCoordinator:
                 pass
             except Exception as e:
                 dp(f"{name}: waiting predecessor or {delay}... failed {e!r}")
-                traceback.print_exception(e)
+                traceback.print_exception(e, file=sys.stderr)
                 pass
         elif delay > 0.0:
             dp(f"{name}: waiting {delay}...")
@@ -248,7 +248,7 @@ class AsyncConnector:
             self._force_close_socket(sock)
             raise
         except OSError as e:
-            self.diag_f(f"{hostport}: connection failed {e!r}")
+            self.diag_f(f"{hostport}: connection failed: {e!r}")
             self._force_close_socket(sock)
             return None
 
@@ -410,6 +410,64 @@ class Forwarder(Thread):
         for t in l:
             t.join()
 
+### Inter-process socket passing
+try:
+    import _winapi
+    is_win32_available = True
+except ImportError:
+    is_win32_available = False
+
+try:
+    if hasattr(socket, "AF_UNIX") and hasattr(socket, "SCM_RIGHTS") and hasattr(socket.socket, "sendmsg"):
+        is_posix_available = True
+    else:
+        is_posix_available = False
+except NameError:
+    is_posix_available = False # no-existence of socket.socket is unlikely...
+
+def make_msgpack_errormsg(m):
+    m = m.encode("utf-8")
+    return b"\x92\xc2\xda" + len(m).to_bytes(2, byteorder="big") + m
+
+def make_msgpack_message(m):
+    if m is None:
+        return b"\x92\xc3\xc0"
+    else:
+        return b"\x92\xc3\xc5" + len(m).to_bytes(2, byteorder="big") + m
+
+def pass_sock_to_fd(channel_fd, sock_to_pass):
+    file_sock = os.fdopen(channel_fd, "wb", closefd=False)
+    try:
+        channel_sock = socket.fromfd(channel_fd, socket.AF_UNIX, socket.SOCK_STREAM)
+        print(["CS", channel_sock], file=sys.stderr)
+        x = socket.send_fds(channel_sock, [make_msgpack_message(None)], fds=[sock_to_pass.fileno()])
+        print(["SFS", x], file=sys.stderr)
+        dp("waiting for ack byte")
+        r = sys.stdin.buffer.read(1)
+        dp("ack byte received {r!r}", r=r)
+    except Exception as e:
+        file_sock.write(make_msgpack_errormsg(repr(e)))
+        traceback.print_exception(e)
+
+def pass_sock_win32(pid, sock_to_pass):
+    print(repr(sock_to_pass), file=sys.stderr)
+    try:
+        wsainfo_blob = sock_to_pass.share(pid)
+        sys.stdout.buffer.write(make_msgpack_message(wsainfo_blob))
+        sys.stdout.buffer.flush()
+        dp("waiting for ack byte")
+        r = sys.stdin.buffer.read(1)
+        dp("ack byte received {r!r}", r=r)
+    except Exception as e:
+        sys.stdout.buffer.write(make_msgpack_errormsg(repr(e)))
+        traceback.print_exception(e)
+
+### Commandline Processing and main routine
+class OurProcessingError(Exception):
+    pass
+class CommandLineError(OurProcessingError):
+    pass
+
 # using an undocumneted interface...
 class ParagraphFillingFormatter(argparse.RawDescriptionHelpFormatter):
     def __init__(self, prog, indent_increment=2, max_help_position=24, width=None):
@@ -430,6 +488,8 @@ class ParagraphFillingFormatter(argparse.RawDescriptionHelpFormatter):
         return ps
 
 def main():
+    use_messagepack = False
+
     hostlist = []
 
     parser = argparse.ArgumentParser(
@@ -463,58 +523,98 @@ attempt for this spec is skipped.
                         help="Staggered delay period (in seconds) between multiple IP address attempts (default: 0.25)")
     parser.add_argument('-q', '--quiet', action='store_const', dest='verbose', const=0,
                         help="Suppress progress/diagnostic messages")
-
+    if is_posix_available:
+        parser.add_argument('--pass-fd', action='store_true',
+                            help="Enable socket passing mode.")
+    else:
+        parser.add_argument('--pass-fd', action='store_true',
+                            help=argparse.SUPPRESS)
+    if is_win32_available:
+        parser.add_argument('--pass-to-pid', type=int, metavar="PID",
+                            help="Enable socket passing mode.")
+    else:
+        parser.add_argument('--pass-to-pid', type=int, metavar="PID",
+                            help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    global _debug
-    if args.verbose >= 3:
-        _debug = True
+    if args.pass_fd or args.pass_to_pid:
+        use_messagepack = True
 
-    if args.use_v4_only and args.use_v6_only:
-        sys.stderr.write("Error: --use_v6_only and --use_v4_only is exclusive\n")
-        parser.print_help()
-        sys.exit(2)
+    try:
+        global _debug
+        if args.verbose >= 3:
+            _debug = True
 
-    use_v6 = not args.use_v4_only
-    use_v4 = not args.use_v6_only
+        if not is_posix_available and args.pass_fd:
+            raise CommandLineError("--pass-to-fd is not supported on this platform")
+        if not is_win32_available and args.pass_to_pid:
+            raise CommandLineError("--pass-to-pid is not supported on this platform")
+        if args.pass_fd and args.pass_to_pid:
+            raise CommandLineError("--pass-to-fd and --pass-to-pid are exclusive")
 
-    for hspec in args.hosts:
-        mo = re.match(r"^((?P<wait>\d+(\.\d+)?):)?(?:[vV](?P<family>[46]):)?(\[(?P<host6>[0-9A-Fa-f:]+)\]|(?P<host>[^/:]+))(/(?P<mask>\d+))?:(?P<port>\d+)$", hspec)
-        if not mo:
-            raise RuntimeError("bad spec: {}".format(hspec))
-        w = mo.group('wait')
-        w = float(w) if w else 0.0
-        h = mo.group('host') or mo.group('host6')
-        nm = mo.group('mask')
-        nm = int(nm) if nm else None
-        p = int(mo.group('port'))
-        family = mo.group('family')
-        hostlist.append(HostSpec(wait = w, family=family, host = h, mask = nm, port = p))
+        if args.use_v4_only and args.use_v6_only:
+            raise CommandLineError("--use_v6_only and --use_v4_only are exclusive")
 
-    c, msg, diag = AsyncConnector.get_fastest_connection(
-        hostlist,
-        use_v4=use_v4,
-        use_v6=use_v6,
-        happy_eyeballs_delay=args.delay
-    )
+        use_v6 = not args.use_v4_only
+        use_v4 = not args.use_v6_only
 
-    if not c:
-        print("cannot connect to any given host.", file=sys.stderr)
-        print(msg, file=sys.stderr)
-        print(diag, file=sys.stderr)
+        for hspec in args.hosts:
+            mo = re.match(r"^((?P<wait>\d+(\.\d+)?):)?(?:[vV](?P<family>[46]):)?(\[(?P<host6>[0-9A-Fa-f:]+)\]|(?P<host>[^/:]+))(/(?P<mask>\d+))?:(?P<port>\d+)$", hspec)
+            if not mo:
+                raise CommandLineError("bad host spec: {}".format(hspec))
+            w = mo.group('wait')
+            w = float(w) if w else 0.0
+            h = mo.group('host') or mo.group('host6')
+            nm = mo.group('mask')
+            nm = int(nm) if nm else None
+            p = int(mo.group('port'))
+            family = mo.group('family')
+            hostlist.append(HostSpec(wait = w, family=family, host = h, mask = nm, port = p))
+
+        c, msg, diag = AsyncConnector.get_fastest_connection(
+            hostlist,
+            use_v4=use_v4,
+            use_v6=use_v6,
+            happy_eyeballs_delay=args.delay
+        )
+
+        if not c:
+            print("cannot connect to any given host.", file=sys.stderr)
+            print(msg, file=sys.stderr)
+            print(diag, file=sys.stderr)
+            raise OurProcessingError("cannot connect to any given host.")
+
+        if args.verbose >= 1:
+            print(msg, file=sys.stderr)
+            if args.verbose >= 2:
+                print(diag, file=sys.stderr)
+
+        c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        c.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except Exception as e:
+        message = "Error: " + e.args[0] if isinstance(e, OurProcessingError) else str(e)
+        if isinstance(e, OurProcessingError):
+            print(message, file=sys.stderr)
+            if isinstance(e, CommandLineError):
+                parser.print_usage(file=sys.stderr)
+        else:
+            traceback.print_exception(e)
+
+        if use_messagepack:
+            of = os.fdopen(args.pass_fd, "wb") if args.pass_fd else sys.stdout.buffer
+            b = make_msgpack_errormsg(message)
+            of.write(b)
+
         sys.exit(1)
 
-    if args.verbose >= 1:
-        print(msg, file=sys.stderr)
-        if args.verbose >= 2:
-            print(diag, file=sys.stderr)
-
-    c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    c.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-
-    Forwarder.run_parallel(
-        ((c, sys.stdout.buffer.raw),
-         (sys.stdin.buffer.raw, c)))
+    if args.pass_fd:
+        pass_sock_to_fd(1, c)
+    elif args.pass_to_pid:
+        pass_sock_win32(args.pass_to_pid, c)
+    else:
+        Forwarder.run_parallel(
+            ((c, sys.stdout.buffer.raw),
+             (sys.stdin.buffer.raw, c)))
 
     c.close()
 

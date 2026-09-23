@@ -8,6 +8,7 @@
 * **Dual-Stack IP Version Control:** Supports explicitly forcing or restricting connection attempts to IPv4 or IPv6 on a per-host or global basis.
 * **Subnet-Aware Connection Filtering:** Evaluates the destination IP against a specified subnet mask before attempting a connection. If the resolved destination does not belong to the expected local network, the connection trial is automatically skipped.
 * **Cross-Platform Compatibility:** Written in pure Python. It runs seamlessly across various operating systems, including Windows (Win32) without requiring a C compiler.
+* **Socket Passing Mode:** It can either perform bidirectional proxying, or pass a connected TCP socket back to the caller process.
 
 ## Typical Use Cases
 
@@ -18,31 +19,31 @@
 
 ## Usage
 
-```text
-usage: multiconnect.py [-h] [-4] [-6] [-v] [--delay DELAY] [-q] hostspec [hostspec ...]
+    usage: multiconnect.py [-h] [-4] [-6] [-v] [--delay DELAY] [-q] hostspec [hostspec ...]
+    
+    A TCP proxy that chooses the first available connection from multiple 
+    destination candidates.
+    
+    positional arguments:
+      hostspec              Connection destination candidates (syntax: '[delay:][protocol:]host[/mask_bits]:port').
+    
+    options:
+      -h, --help            Show this help message and exit
+      -4, --use-v4-only     Force the use of IPv4 addresses only.
+      -6, --use-v6-only     Force the use of IPv6 addresses only.
+      -v, --verbose         Increase verbosity level for diagnostics.
+      --delay DELAY, --happy-eyeballs-delay DELAY
+                            Staggered delay period (in seconds) between multiple IP address attempts (default: 0.25).
+      -q, --quiet           Suppress progress/diagnostic messages
+      --pass-fd             Enable socket passing mode.
+      --pass-to-pid PID     Enable socket passing mode.
 
-A TCP proxy that chooses the first available connection from multiple 
-destination candidates.
-
-positional arguments:
-  hostspec              Connection destination candidates (syntax: '[delay:][protocol:]host[/mask_bits]:port').
-
-options:
-  -h, --help            Show this help message and exit
-  -4, --use-v4-only     Force the use of IPv4 addresses only.
-  -6, --use-v6-only     Force the use of IPv6 addresses only.
-  -v, --verbose         Increase verbosity level for diagnostics.
-  --delay DELAY, --happy-eyeballs-delay DELAY
-                        Staggered delay period (in seconds) between multiple IP address attempts (default: 0.25).
-  -q, --quiet           Suppress progress/diagnostic messages
-```
 
 ### Host Specifications
 
 The syntax for each host specification is:
-```text
-[<delay>:][<protocol>:]<host>[/<mask_bits>]:<port>
-```
+
+    [<delay>:][<protocol>:]<host>[/<mask_bits>]:<port>
 
 In its simplest form, you can specify just the host and port (e.g., `example.com:22`). 
 Literal IPv6 addresses containing colons must be enclosed in square brackets (e.g., `[::1]:22`).
@@ -61,36 +62,29 @@ You can customize the connection behavior using the following modifiers:
 
 * **`-4` / `-6`**: Forces the script to use only the corresponding IP version, overriding any DNS results or specific host definitions.
 * **`--delay`**: Defines the staggered delay period (in seconds) between connection attempts for multiple IP addresses resolved from a single hostname.
+* **`--pass-fd``, `--pass-to-pid`**: Enables socket passing mode.  See [socket-passing.md](socket-passing.md) for details.
 
 ## CLI Examples
 
 ### 1. Handling Hairpin NAT / Split-Horizon Environments
 When your server is accessible via a public IP (`192.0.2.80`) from the outside, but via a private IP (`192.168.1.80`) when you are inside the office, you can pass both destinations. By adding the subnet mask (`/24`), `multiconnect` will smartly evaluate the network and skip inappropriate connection attempts:
 
-> ```text
-> python3 multiconnect.py 192.168.1.80/24:22 1.0:192.0.2.80:22
-> ```
+    python3 multiconnect.py 192.168.1.80/24:22 1.0:192.0.2.80:22
 
 ### 2. Dual-Stack IPv4/IPv6 Connection (Fully Automated)
 You don't need to specify IP versions manually. Just provide the hostname, and `multiconnect` will automatically resolve both IPv6 and IPv4 addresses, attempting connections concurrently to choose the earliest available one:
 
-> ```text
-> python3 multiconnect.py example.com:80
-> ```
+    python3 multiconnect.py example.com:80
 
 ### 3. Adding Connection Preferences with Protocol Restrictions
 If you want to try a dual-stack primary server first, but want to restrict the backup server to IPv4 only and delay its attempt by 0.5 seconds:
 
-> ```text
-> python3 multiconnect.py primary-server.example.com:8080 0.5:v4:backup-server.example.net:8080
-> ```
+    python3 multiconnect.py primary-server.example.com:8080 0.5:v4:backup-server.example.net:8080
 
 ### 4. Specifying a Subnet Mask with a Literal IPv6 Address
 You can combine delays, subnet masks, and literal IPv6 addresses (enclosed in square brackets) for precise local network filtering:
 
-> ```text
-> python3 multiconnect.py 0.5:[2001:db8::1]/64:80
-> ```
+    python3 multiconnect.py 0.5:[2001:db8::1]/64:80
 
 ## Integration Configurations
 
@@ -101,10 +95,8 @@ To use `multiconnect` with OpenSSH, add a `ProxyCommand` directive to your targe
 
 For example, to configure a primary server with local subnet awareness, a staggered fallback, and a secondary backup server:
 
-```text
-Host primary-server.example.com
-  ProxyCommand python3 /path/to/multiconnect.py 192.168.1.80/24:22 0.5:primary-server.example.com:22 1.0:v4:backup-server.example.net:22
-```
+    Host primary-server.example.com
+        ProxyCommand python3 /path/to/multiconnect.py 192.168.1.80/24:22 0.5:primary-server.example.com:22 1.0:v4:backup-server.example.net:22
 
 ### 2. PuTTY
 You can configure PuTTY to use `multiconnect` as a local proxy. 
@@ -116,14 +108,13 @@ You can configure PuTTY to use `multiconnect` as a local proxy.
 Due to PuTTY's internal parsing rules, backslashes and percent signs must be doubled (`\\`) to correctly pass environment variables. The examples below are already formatted for PuTTY; **copy and paste them exactly as they are**.
 
 * **Using an absolute path:**
-```text
-\\path\\to\\multiconnect.py 192.168.1.80/24:22 0.5:primary-server.example.com:22 1.0:v4:backup-server.example.net:22
-```
+
+    \\path\\to\\multiconnect.py 192.168.1.80/24:22 0.5:primary-server.example.com:22 1.0:v4:backup-server.example.net:22
+
 
 * **Using a relative path with the Windows User Profile directory:**
-```text
-cmd /c %%USERPROFILE%%\\libexec\\multiconnect.py 192.168.1.80/24:22 0.5:primary-server.example.com:22 1.0:v4:backup-server.example.net:22
-```
+
+    cmd /c %%USERPROFILE%%\\libexec\\multiconnect.py 192.168.1.80/24:22 0.5:primary-server.example.com:22 1.0:v4:backup-server.example.net:22
 
 ## Copyright and License
 
@@ -133,7 +124,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+  http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
