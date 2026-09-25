@@ -8,7 +8,7 @@ multiconnect: A TCP proxy choosing fastest TCP/IP connection.
 # See <https://www.apache.org/licenses/LICENSE-2.0>
 
 from typing import Any, Callable, Coroutine, Optional, Set, Tuple
-import sys, os
+import sys, os, io
 
 import asyncio
 import socket
@@ -20,6 +20,8 @@ from collections import namedtuple
 import traceback
 import re
 import argparse
+
+__all__ = ["get_fastest_connection", "async_get_fastest_connection"]
 
 _debug = False
 def dp(f, **k):
@@ -41,6 +43,39 @@ class HostSpec(namedtuple('HostSpec', ['host', 'port', 'mask', 'wait', 'family']
         return "%s%s%s%s:%d" % (w, f, h, m, self.port)
     def short_str(self):
         return "%s:%d" % (self.host, self.port)
+
+    @classmethod
+    def fromstrlist(klass, hspecs, default_delay=0.0):
+        return [ klass.fromstr(x, default_delay=(0.0 if i == 0 else default_delay))
+                 for (i, x) in enumerate(hspecs) ]
+
+    @classmethod
+    def fromstr(klass, hspec, default_delay=0.0):
+        if isinstance(hspec, HostSpec): # already processed
+            return hspec
+        if isinstance(hspec, tuple): # special case
+            if len(hspec) != 2: raise ValueError("bad host spec: {}".format(hspec))
+            return klass(wait=default_delay, family=None, host = hspec[0], mask = None, port = hspec[1])
+
+        mo = re.match(r"^((?P<wait>\d+(\.\d+)?):)?(?:[vV](?P<family>[46]):)?(\[(?P<host6>[0-9A-Fa-f:]+)\]|(?P<host>[^/:]+))(/(?P<mask>\d+))?:(?P<port>\d+)$", hspec)
+        if not mo:
+            raise ValueError("bad host spec: {}".format(hspec))
+        w = mo.group('wait')
+        w = float(w) if w else default_delay
+        h = mo.group('host') or mo.group('host6')
+        nm = mo.group('mask')
+        nm = int(nm) if nm else None
+        p = int(mo.group('port'))
+        family = mo.group('family')
+        if family == None:
+            family = None
+        elif family == "4":
+            family = socket.AF_INET
+        elif family == "6":
+            family = socket.AF_INET6
+        else:
+            raise ValueError
+        return klass(wait=w, family=family, host = h, mask = nm, port = p)
 
 class TaskCoordinator:
     """
@@ -121,6 +156,7 @@ class TaskCoordinator:
             pass
 
         if self.winner_event.is_set():
+            dp(f"{name}: winner is determined: cancelling")
             func.close()
             return
 
@@ -184,7 +220,7 @@ class AsyncConnector:
         if res is not None:
             self._force_close_socket(res)
 
-    async def connect_singleip_worker(
+    async def _connect_singleip_worker(
             self,
             addr_info: tuple,
             mask: Optional[int],
@@ -220,7 +256,7 @@ class AsyncConnector:
                 remoteip = ipaddress.ip_address(addr_info[4][0])
                 local_if = ipaddress.ip_interface("%s/%d" % (laddr[0], mask))
                 if remoteip not in local_if.network:
-                    self.diag_f(f"{worker_id}: {remoteip} not in network {local_if}")
+                    self.diag_f(f"{worker_id}: {remoteip} not in network {local_if}\n")
                 else:
                     ok = True
             if not ok:
@@ -242,17 +278,17 @@ class AsyncConnector:
                 sock.close()
                 raise
 
-            self.msg_f(f"CONNECTED to {hostport}")
+            self.msg_f(f"CONNECTED to {hostport}\n")
             return sock
         except asyncio.CancelledError:
             self._force_close_socket(sock)
             raise
         except OSError as e:
-            self.diag_f(f"{hostport}: connection failed: {e!r}")
+            self.diag_f(f"{hostport}: connection failed: {e!r}\n")
             self._force_close_socket(sock)
             return None
 
-    async def host_happy_eyeballs_worker(
+    async def _host_happy_eyeballs_worker(
             self,
             hostspec,
             worker_id: str,
@@ -260,8 +296,8 @@ class AsyncConnector:
         """Worker coroutine for a single DNS-named host.
         Spawn sub-coroutine for IP addresses among several IP addresses."""
 
-        our_use_v6 = self.use_v6 and hostspec.family != "4"
-        our_use_v4 = self.use_v4 and hostspec.family != "6"
+        our_use_v6 = self.use_v6 and hostspec.family != socket.AF_INET
+        our_use_v4 = self.use_v4 and hostspec.family != socket.AF_INET6
 
         loop = asyncio.get_running_loop()
 
@@ -289,9 +325,9 @@ class AsyncConnector:
             delay = 0.0 if i == 0 else self.happy_eyeballs_delay
             host = addr[4][0]
             port = addr[4][1]
-            nwi = f"{worker_id}-{i!s}"
+            nwi = f"{worker_id}-{i+1!s}"
             new_task = await self.coord.spawn(
-                self.connect_singleip_worker(mask=hostspec.mask, addr_info=addr, worker_id=nwi),
+                self._connect_singleip_worker(mask=hostspec.mask, addr_info=addr, worker_id=nwi),
                 predecessor=prev_ip_task,
                 delay=delay,
                 name=f"{nwi}:: {host}:{port}"
@@ -304,25 +340,26 @@ class AsyncConnector:
             await asyncio.wait([prev_ip_task])
             dp(f"connection to {host}: waiting for task {prev_ip_task.get_name()} done. finishing")
 
-    async def async_get_fastest_connection(self, hosts):
-        """The main coroutine of get_fastest_connection. Use get_fastest_connection below."""
+    async def _async_get_fastest_connection_core(self, hosts):
+        """The main coroutine of get_fastest_connection.
+        Use get_fastest_connection or async_get_fastest_connection below."""
         self.coord = coord = TaskCoordinator(clean_up_task=self._looser_sentinel)
+
+        hosts = HostSpec.fromstrlist(hosts, default_delay=self.happy_eyeballs_delay)
 
         prev_task = None
         for i, hostspec in enumerate(hosts):
             prev_task = await coord.spawn(
-                self.host_happy_eyeballs_worker(
+                self._host_happy_eyeballs_worker(
                     hostspec,
-                    worker_id=f"{i!s}"),
-                name = f"{i}:: {hostspec!s}",
+                    worker_id=f"{i+1!s}"),
+                name = f"{i+1}:: {hostspec!s}",
                 delay=hostspec.wait, predecessor=prev_task)
             if not prev_task: break
 
         result = await coord.run_until_complete()
 
-        msg = "\n".join(self.msg_v)
-        diag = "\n".join(self.diag_v)
-        return result, msg, diag
+        return result
 
     def __init__(self, msg=None, diag=None, use_v4=True, use_v6=True,
                  happy_eyeballs_delay=0.25):
@@ -330,41 +367,82 @@ class AsyncConnector:
         self.use_v4 = use_v4
         self.use_v6 = use_v6
         self.happy_eyeballs_delay = happy_eyeballs_delay
-        self.msg_v = []
-        self.diag_v = []
-        self.msg_f = msg if msg else self.msg_v.append
-        self.diag_f = diag if diag else self.diag_v.append
+        self.msg_f = msg if msg else lambda x: None
+        self.diag_f = diag if diag else lambda x: None
 
     @classmethod
     def get_fastest_connection(klass, hosts, **k):
+        """Try simultanously connecting to given host lists and return the ealienst available one.
+
+           The argument is a list of HostSpec's containing the
+           following fields:
+
+             - wait (real): seconds to delay connections.
+
+             - host (string): a target host name or an IPv4 address to
+               connect.
+
+             - mask (optional integer): a number of bits for IPv4
+               netmask.  If the target host does not belong to the
+               same network as the running host, the connection will
+               not be attempted.
+
+             - port (integer): a TCP port number to connect.
+
+           For compatibility, a string (`"host:port"` or
+           `"[v6addr]:port"`) or and 2-tuple `(host, port)` is also
+           accepted for list elements.
+
+           Optional keyword arguments are following:
+
+             - msg and diag: functions receiving a progress and
+               diagnostic messages during running.  If omitted, these
+               will not be collected.
+
+             - use_v4 and use_v6: default True.
+
+             - happy_eyeballs_delay: default 0.250.  Time in seconds
+               between multiple addresses for a single host.
+
+           Returns a connected TCP socket channel or None.
+
+        This is ordinary routine version.
+        If your program uses asyncio, use `async_get_fastest_connection`,
+        or `nest_asyncio` from PyPI.
+
+        """
+        co = klass(**k)._async_get_fastest_connection_core(hosts)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop == None:
+            return asyncio.run(co)
+
+        try:
+            return loop.run_until_complete(co)
+        except RuntimeError as e:
+            if "this event loop is already running" in str(e).lower():
+                args = list(e.args)
+                args[0] = args[0] + " (consider to use nest_asyncio from PyPI)"
+                raise RuntimeError(*args) from e
+            else:
+                raise
+
+    @classmethod
+    def async_get_fastest_connection(klass, hosts, **k):
         """Try simultanously connecting to given host lists and return the fastest one.
 
-Argument is a list of HostSpec's containing the following fields:
+           See get_fastest_connection for arguments.
+           This is awaitable coroutine version.
 
-  - wait (real): seconds to delay connections.
-
-  - host (string): a target host name or an IPv4 address to connect.
-
-  - mask (optional integer):
-    a number of bits for IPv4 netmask.
-    If the target host does not belong to the same network as the running host,
-    the connection will not be attempted.
-
-  - port (integer): a TCP port number to connect.
-
-Optional msg and diag are functions receiving a progress and
-diagnostic messages during running.  If omitted, these will
-be returned in the return values msg and diag below.
-
-Returning a tuple of (c, msg, diag), where
-  - c is a connected TCP socket channel or None,
-  - msg, diag is a string containing message and diagnostic messages.
-"""
-        return asyncio.run(klass(**k).
-                           async_get_fastest_connection(hosts))
+        """
+        return klass(**k)._async_get_fastest_connection_core(hosts)
 
 ### Bidirectional data forwarding (proxying).
-### For optimal throughput, it is implemented as a threaded routine, not coroutines.
+### For optimal throughput, it is implemented as a threaded routines, not coroutines.
 
 bufsize = 1048576
 class Forwarder(Thread):
@@ -425,41 +503,38 @@ try:
 except NameError:
     is_posix_available = False # no-existence of socket.socket is unlikely...
 
-def make_msgpack_errormsg(m):
+def _make_msgpack_errormsg(m):
     m = m.encode("utf-8")
     return b"\x92\xc2\xda" + len(m).to_bytes(2, byteorder="big") + m
 
-def make_msgpack_message(m):
+def _make_msgpack_message(m):
     if m is None:
         return b"\x92\xc3\xc0"
     else:
         return b"\x92\xc3\xc5" + len(m).to_bytes(2, byteorder="big") + m
 
-def pass_sock_to_fd(channel_fd, sock_to_pass):
+def _pass_sock_to_fd(channel_fd, sock_to_pass):
     file_sock = os.fdopen(channel_fd, "wb", closefd=False)
     try:
         channel_sock = socket.fromfd(channel_fd, socket.AF_UNIX, socket.SOCK_STREAM)
-        print(["CS", channel_sock], file=sys.stderr)
-        x = socket.send_fds(channel_sock, [make_msgpack_message(None)], fds=[sock_to_pass.fileno()])
-        print(["SFS", x], file=sys.stderr)
+        x = socket.send_fds(channel_sock, [_make_msgpack_message(None)], fds=[sock_to_pass.fileno()])
         dp("waiting for ack byte")
         r = sys.stdin.buffer.read(1)
         dp("ack byte received {r!r}", r=r)
     except Exception as e:
-        file_sock.write(make_msgpack_errormsg(repr(e)))
+        file_sock.write(_make_msgpack_errormsg(repr(e)))
         traceback.print_exception(e)
 
-def pass_sock_win32(pid, sock_to_pass):
-    print(repr(sock_to_pass), file=sys.stderr)
+def _pass_sock_win32(pid, sock_to_pass):
     try:
         wsainfo_blob = sock_to_pass.share(pid)
-        sys.stdout.buffer.write(make_msgpack_message(wsainfo_blob))
+        sys.stdout.buffer.write(_make_msgpack_message(wsainfo_blob))
         sys.stdout.buffer.flush()
         dp("waiting for ack byte")
         r = sys.stdin.buffer.read(1)
         dp("ack byte received {r!r}", r=r)
     except Exception as e:
-        sys.stdout.buffer.write(make_msgpack_errormsg(repr(e)))
+        sys.stdout.buffer.write(_make_msgpack_errormsg(repr(e)))
         traceback.print_exception(e)
 
 ### Commandline Processing and main routine
@@ -558,36 +633,33 @@ attempt for this spec is skipped.
         use_v6 = not args.use_v4_only
         use_v4 = not args.use_v6_only
 
-        for hspec in args.hosts:
-            mo = re.match(r"^((?P<wait>\d+(\.\d+)?):)?(?:[vV](?P<family>[46]):)?(\[(?P<host6>[0-9A-Fa-f:]+)\]|(?P<host>[^/:]+))(/(?P<mask>\d+))?:(?P<port>\d+)$", hspec)
-            if not mo:
-                raise CommandLineError("bad host spec: {}".format(hspec))
-            w = mo.group('wait')
-            w = float(w) if w else 0.0
-            h = mo.group('host') or mo.group('host6')
-            nm = mo.group('mask')
-            nm = int(nm) if nm else None
-            p = int(mo.group('port'))
-            family = mo.group('family')
-            hostlist.append(HostSpec(wait = w, family=family, host = h, mask = nm, port = p))
+        try:
+            hostlist = HostSpec.fromstrlist(args.hosts, default_delay=args.delay)
+        except ValueError as e:
+            raise CommandLineError(*e.args)
 
-        c, msg, diag = AsyncConnector.get_fastest_connection(
+        msg = io.StringIO()
+        diag = io.StringIO()
+
+        c = AsyncConnector.get_fastest_connection(
             hostlist,
             use_v4=use_v4,
             use_v6=use_v6,
+            msg = msg.write,
+            diag = diag.write,
             happy_eyeballs_delay=args.delay
         )
 
         if not c:
             print("cannot connect to any given host.", file=sys.stderr)
-            print(msg, file=sys.stderr)
-            print(diag, file=sys.stderr)
+            print(msg.getvalue(), file=sys.stderr)
+            print(diag.getvalue(), file=sys.stderr, flush=True)
             raise OurProcessingError("cannot connect to any given host.")
 
         if args.verbose >= 1:
-            print(msg, file=sys.stderr)
+            print(msg.getvalue(), end="", file=sys.stderr, flush=True)
             if args.verbose >= 2:
-                print(diag, file=sys.stderr)
+                print(diag.getvalue(), end="", file=sys.stderr, flush=True)
 
         c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         c.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -602,15 +674,15 @@ attempt for this spec is skipped.
 
         if use_messagepack:
             of = os.fdopen(args.pass_fd, "wb") if args.pass_fd else sys.stdout.buffer
-            b = make_msgpack_errormsg(message)
+            b = _make_msgpack_errormsg(message)
             of.write(b)
 
         sys.exit(1)
 
     if args.pass_fd:
-        pass_sock_to_fd(1, c)
+        _pass_sock_to_fd(1, c)
     elif args.pass_to_pid:
-        pass_sock_win32(args.pass_to_pid, c)
+        _pass_sock_win32(args.pass_to_pid, c)
     else:
         Forwarder.run_parallel(
             ((c, sys.stdout.buffer.raw),
@@ -620,5 +692,8 @@ attempt for this spec is skipped.
 
     sys.exit(0)
 
-if __name__=='__main__':
+if __name__ == '__main__':
     main()
+else:
+    get_fastest_connection = AsyncConnector.get_fastest_connection
+    async_get_fastest_connection = AsyncConnector.async_get_fastest_connection
