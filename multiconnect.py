@@ -8,7 +8,7 @@ multiconnect: A TCP proxy choosing fastest TCP/IP connection.
 # See <https://www.apache.org/licenses/LICENSE-2.0>
 
 from typing import Any, Callable, Coroutine, Optional, Set, Tuple
-import sys, os, io
+import sys, os, io, inspect
 
 import asyncio
 import socket
@@ -85,6 +85,7 @@ class TaskCoordinator:
         self.winner_result: Optional[Any] = None
         self.winner_event = asyncio.Event()
         self.winning_task = None
+        self.gathered_exceptions = []
         self.active_tasks: Set[asyncio.Task] = set()
         self.clean_up_task = clean_up_task
 
@@ -172,9 +173,11 @@ class TaskCoordinator:
                 raise
             except OSError as e:
                 print(f"{name}: {e!r}", file=sys.stderr)
+                self.gathered_exceptions.append(e)
             except Exception as e:
                 print(f"{name}: {e!r}", file=sys.stderr)
                 traceback.print_exception(e)
+                self.gathered_exceptions.append(e)
             return None
 
         _wrapper.__name__ = func.__name__
@@ -184,7 +187,7 @@ class TaskCoordinator:
         task.add_done_callback(lambda t: self.active_tasks.discard(t))
         return task
 
-    async def run_until_complete(self) -> Any:
+    async def run_until_complete(self, raise_exception=True) -> Any:
         """Run tasks and wait a winner"""
         while not self.winner_event.is_set() and self.active_tasks:
             done, _ = await asyncio.wait(
@@ -198,6 +201,8 @@ class TaskCoordinator:
             asyncio.create_task(self._cleanup_losers())
             return self.winner_result
         else:
+            if raise_exception and len(self.gathered_exceptions) >= 1:
+                raise self.gathered_exceptions[-1]
             return None
 
 class AsyncConnector:
@@ -340,7 +345,7 @@ class AsyncConnector:
             await asyncio.wait([prev_ip_task])
             dp(f"connection to {host}: waiting for task {prev_ip_task.get_name()} done. finishing")
 
-    async def _async_get_fastest_connection_core(self, hosts):
+    async def _async_get_fastest_connection_core(self, hosts, raise_exception=True):
         """The main coroutine of get_fastest_connection.
         Use get_fastest_connection or async_get_fastest_connection below."""
         self.coord = coord = TaskCoordinator(clean_up_task=self._looser_sentinel)
@@ -357,7 +362,7 @@ class AsyncConnector:
                 delay=hostspec.wait, predecessor=prev_task)
             if not prev_task: break
 
-        result = await coord.run_until_complete()
+        result = await coord.run_until_complete(raise_exception=raise_exception)
 
         return result
 
@@ -370,6 +375,7 @@ class AsyncConnector:
         self.msg_f = msg if msg else lambda x: None
         self.diag_f = diag if diag else lambda x: None
 
+    # Two public APIs for general use
     @classmethod
     def get_fastest_connection(klass, hosts, **k):
         """Try simultanously connecting to given host lists and return the ealienst available one.
@@ -404,11 +410,15 @@ class AsyncConnector:
              - happy_eyeballs_delay: default 0.250.  Time in seconds
                between multiple addresses for a single host.
 
-           Returns a connected TCP socket channel or None.
+           Returns a connected TCP socket.socket channel when succeeded.
 
-        This is ordinary routine version.
-        If your program uses asyncio, use `async_get_fastest_connection`,
-        or `nest_asyncio` from PyPI.
+           Upon failure, it may either return None or raise exceptions.
+
+           This is ordinary routine version.
+
+           If your program uses `asyncio`, use
+           `async_get_fastest_connection`, or `nest_asyncio` from
+           PyPI.
 
         """
         co = klass(**k)._async_get_fastest_connection_core(hosts)
@@ -432,14 +442,39 @@ class AsyncConnector:
                 raise
 
     @classmethod
-    def async_get_fastest_connection(klass, hosts, **k):
+    async def async_get_fastest_connection(klass, hosts, rawsocket=False, **kwargs):
         """Try simultanously connecting to given host lists and return the fastest one.
 
            See get_fastest_connection for arguments.
            This is awaitable coroutine version.
 
+           If keyword option `rawsocket` is set, it will return a raw `socket.socket` object.
+           Otherwise, the result will be wrapped to asyncio.StreamReader and StreamWriter.
+
+           In either case, if connection was not succeed, it may either return None(s) or
+           raise exceptions.
+
         """
-        return klass(**k)._async_get_fastest_connection_core(hosts)
+        if rawsocket:
+            _class_kwargs = kwargs
+            _aio_kwargs = {}
+        else:
+            _class_keywords = set(inspect.signature(klass).parameters.keys())
+            _class_kwargs = { k: v for k, v in kwargs.items() if k in _class_keywords }
+            _aio_kwargs = { k: v for k, v in kwargs.items() if k not in _class_keywords }
+
+        result = await klass(**_class_kwargs)._async_get_fastest_connection_core(hosts, raise_exception=True)
+
+        if rawsocket:
+            return result
+
+        if result == None:
+            return (None, None)
+        result.setblocking(False)
+        return await asyncio.open_connection(sock=result,
+                                             #host=None, port=None, family=None, proto=None, flags=None,
+                                             #happy_eyeballs_delay=None, interleave=None, local_addr=None,
+                                             **_aio_kwargs)
 
 ### Bidirectional data forwarding (proxying).
 ### For optimal throughput, it is implemented as a threaded routines, not coroutines.
@@ -641,14 +676,14 @@ attempt for this spec is skipped.
         msg = io.StringIO()
         diag = io.StringIO()
 
-        c = AsyncConnector.get_fastest_connection(
-            hostlist,
-            use_v4=use_v4,
-            use_v6=use_v6,
-            msg = msg.write,
-            diag = diag.write,
-            happy_eyeballs_delay=args.delay
-        )
+        c = asyncio.run(
+                AsyncConnector(
+                    use_v4=use_v4,
+                    use_v6=use_v6,
+                    msg = msg.write,
+                    diag = diag.write,
+                    happy_eyeballs_delay=args.delay).
+                    _async_get_fastest_connection_core(hostlist, raise_exception=False))
 
         if not c:
             print("cannot connect to any given host.", file=sys.stderr)
@@ -660,9 +695,6 @@ attempt for this spec is skipped.
             print(msg.getvalue(), end="", file=sys.stderr, flush=True)
             if args.verbose >= 2:
                 print(diag.getvalue(), end="", file=sys.stderr, flush=True)
-
-        c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        c.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     except Exception as e:
         message = "Error: " + e.args[0] if isinstance(e, OurProcessingError) else str(e)
         if isinstance(e, OurProcessingError):
@@ -684,6 +716,8 @@ attempt for this spec is skipped.
     elif args.pass_to_pid:
         _pass_sock_win32(args.pass_to_pid, c)
     else:
+        c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        c.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         Forwarder.run_parallel(
             ((c, sys.stdout.buffer.raw),
              (sys.stdin.buffer.raw, c)))
