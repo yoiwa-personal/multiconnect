@@ -7,8 +7,7 @@ multiconnect: A TCP proxy choosing fastest TCP/IP connection.
 # Redistributable under Apache License, version 2.0.
 # See <https://www.apache.org/licenses/LICENSE-2.0>
 
-from typing import Any, Callable, Coroutine, Optional, Set, Tuple
-import sys, os, io, inspect
+import sys, os, io, inspect, struct
 
 import asyncio
 import socket
@@ -24,6 +23,7 @@ import argparse
 __all__ = ["get_fastest_connection", "async_get_fastest_connection"]
 
 _debug = False
+
 def dp(f, **k):
     if _debug:
         if len(k):
@@ -31,7 +31,7 @@ def dp(f, **k):
         print(f.format(**k), file=sys.stderr)
 
 def _print_to_stderr(*a, **k):
-    print(*a, **k, file=stderr)
+    print(*a, **k, file=sys.stderr)
 
 class HostSpec(namedtuple('HostSpec', ['host', 'port', 'mask', 'wait', 'family'])):
     def __str__(self):
@@ -45,13 +45,13 @@ class HostSpec(namedtuple('HostSpec', ['host', 'port', 'mask', 'wait', 'family']
         return "%s:%d" % (self.host, self.port)
 
     @classmethod
-    def fromstrlist(klass, hspecs, default_delay=0.0):
+    def fromstrlist(klass, hspecs, default_delay = 0.0):
         return [ klass.fromstr(x, default_delay=(0.0 if i == 0 else default_delay))
                  for (i, x) in enumerate(hspecs) ]
 
     @classmethod
     def fromstr(klass, hspec, default_delay=0.0):
-        if isinstance(hspec, HostSpec): # already processed
+        if isinstance(hspec, klass): # already processed
             return hspec
         if isinstance(hspec, tuple): # special case
             if len(hspec) != 2: raise ValueError("bad host spec: {}".format(hspec))
@@ -82,14 +82,14 @@ class TaskCoordinator:
     Generic Coordinator class for Parallel Racing Tasks
     """
     def __init__(self, clean_up_task = (lambda x: None)):
-        self.winner_result: Optional[Any] = None
+        self.winner_result = None
         self.winner_event = asyncio.Event()
         self.winning_task = None
         self.gathered_exceptions = []
-        self.active_tasks: Set[asyncio.Task] = set()
+        self.active_tasks = set()
         self.clean_up_task = clean_up_task
 
-    def set_winner(self, result: Any, winning_task: asyncio.Task):
+    def set_winner(self, result, winning_task):
         """Decide the winner, and cancel all other running tasks"""
         if not self.winner_event.is_set():
             self.winning_task = winning_task
@@ -114,13 +114,7 @@ class TaskCoordinator:
         for res in results:
             self.clean_up_task(res)
 
-    async def spawn(
-            self,
-            func: Coroutine[Any, Any, Any],
-            name : Optional[str] = None,
-            predecessor: Optional[asyncio.Task] = None,
-            delay: float = 0.0,
-    ) -> asyncio.Task:
+    async def spawn(self, func, name=None, predecessor=None, delay=0.0):
         """
         Run a new task under the coordinator.
         Wait until predecessor fails or delay seconds, whichever is faster.
@@ -187,7 +181,7 @@ class TaskCoordinator:
         task.add_done_callback(lambda t: self.active_tasks.discard(t))
         return task
 
-    async def run_until_complete(self, raise_exception=True) -> Any:
+    async def run_until_complete(self, raise_exception=True):
         """Run tasks and wait a winner"""
         while not self.winner_event.is_set() and self.active_tasks:
             done, _ = await asyncio.wait(
@@ -220,17 +214,12 @@ class AsyncConnector:
         except Exception:
             pass
 
-    def _looser_sentinel(res):
+    def _looser_sentinel(self, res):
         """Call-back for every returned but not selected results."""
         if res is not None:
             self._force_close_socket(res)
 
-    async def _connect_singleip_worker(
-            self,
-            addr_info: tuple,
-            mask: Optional[int],
-            worker_id: str
-    ):
+    async def _connect_singleip_worker(self, addr_info, mask, worker_id):
         loop = asyncio.get_running_loop()
 
         family, type_, proto, canonname, sockaddr = addr_info
@@ -293,11 +282,7 @@ class AsyncConnector:
             self._force_close_socket(sock)
             return None
 
-    async def _host_happy_eyeballs_worker(
-            self,
-            hostspec,
-            worker_id: str,
-    ):
+    async def _host_happy_eyeballs_worker(self, hostspec, worker_id):
         """Worker coroutine for a single DNS-named host.
         Spawn sub-coroutine for IP addresses among several IP addresses."""
 
@@ -321,7 +306,7 @@ class AsyncConnector:
                 ordered_addrs.append(v4_addrs[idx])
 
         if not ordered_addrs:
-            self.diag_v("{worker_id}: connection to {host} failed: no useable destination IP")
+            self.diag_f("{worker_id}: connection to {host} failed: no useable destination IP")
             return None
 
         prev_ip_task = None
