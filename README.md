@@ -105,7 +105,7 @@ You can configure PuTTY to use `multiconnect` as a local proxy.
 2. Select **Local** as the **Proxy type**.
 3. In the **Proxy hostname** or **Telnet command, or local proxy command** field, enter the command line exactly as shown below.
 
-Due to PuTTY's internal parsing rules, backslashes and percent signs must be doubled (`\\`) to correctly pass environment variables. The examples below are already formatted for PuTTY; **copy and paste them exactly as they are**.
+Due to PuTTY's internal parsing rules, backslashes and percent signs must be doubled (`\\`) to correctly pass environment variables.
 
 * **Using an absolute path:**
 
