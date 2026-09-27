@@ -20,9 +20,13 @@ import traceback
 import re
 import argparse
 
-__all__ = ["get_fastest_connection", "async_get_fastest_connection"]
+from typing import (Any, Coroutine, Iterable, NamedTuple, Never,
+                    Optional, TypeVar, Union, Generic, Self)
+from collections.abc import Callable
 
-_debug = False
+__all__: list[str] = ["get_fastest_connection", "async_get_fastest_connection"]
+
+_debug: bool = False
 
 def dp(f, **k):
     if _debug:
@@ -34,23 +38,38 @@ def _print_to_stderr(*a, **k):
     print(*a, **k, file=sys.stderr)
 
 class HostSpec(namedtuple('HostSpec', ['host', 'port', 'mask', 'wait', 'family'])):
-    def __str__(self):
+    host: str
+    port: int
+    mask: Optional[int]
+    wait: float
+    family: Optional[int]
+
+    def __str__(self) -> str:
         w = ("%g:" % self.wait) if self.wait else ""
-        f = "" if self.family == None else "[V%sONLY] " % self.family
+        f = ("" if self.family == None
+             else "[V4ONLY] " if self.family == socket.AF_INET
+             else "[V6ONLY] " if self.family == socket.AF_INET6
+             else f"[{self.family!r}-only]")
         h = self.host
         h = "[" + h + "]" if ":" in h else h
         m = ("/%d" % self.mask) if self.mask else ""
         return "%s%s%s%s:%d" % (w, f, h, m, self.port)
-    def short_str(self):
+    def short_str(self) -> str:
         return "%s:%d" % (self.host, self.port)
 
     @classmethod
-    def fromstrlist(klass, hspecs, default_delay = 0.0):
+    def fromstrlist(
+            klass, 
+            hspecs: Iterable[Union[str, tuple[str, int], Self]],
+            default_delay: float = 0.0) -> list[Self]:
         return [ klass.fromstr(x, default_delay=(0.0 if i == 0 else default_delay))
                  for (i, x) in enumerate(hspecs) ]
 
     @classmethod
-    def fromstr(klass, hspec, default_delay=0.0):
+    def fromstr(
+            klass,
+            hspec: Union[str, tuple[str, int], Self],
+            default_delay: float = 0.0) -> Self:
         if isinstance(hspec, klass): # already processed
             return hspec
         if isinstance(hspec, tuple): # special case
@@ -77,19 +96,23 @@ class HostSpec(namedtuple('HostSpec', ['host', 'port', 'mask', 'wait', 'family']
             raise ValueError
         return klass(wait=w, family=family, host = h, mask = nm, port = p)
 
-class TaskCoordinator:
+T = TypeVar('T')
+
+_HostSpec_Argument = Union[str, tuple[str, int], HostSpec]
+
+class TaskCoordinator(Generic[T]):
     """
     Generic Coordinator class for Parallel Racing Tasks
     """
     def __init__(self, clean_up_task = (lambda x: None)):
-        self.winner_result = None
-        self.winner_event = asyncio.Event()
-        self.winning_task = None
-        self.gathered_exceptions = []
-        self.active_tasks = set()
-        self.clean_up_task = clean_up_task
+        self.winner_result: Optional[T] = None
+        self.winner_event: asyncio.locks.Event = asyncio.Event()
+        self.winning_task: Optional[asyncio.tasks.Task[None]] = None
+        self.gathered_exceptions: list[Exception]  = []
+        self.active_tasks: set[asyncio.tasks.Task[None]] = set()
+        self.clean_up_task: Callable[[T], Any] = clean_up_task
 
-    def set_winner(self, result, winning_task):
+    def set_winner(self, result: T, winning_task: asyncio.tasks.Task[None]) -> None:
         """Decide the winner, and cancel all other running tasks"""
         if not self.winner_event.is_set():
             self.winning_task = winning_task
@@ -99,7 +122,7 @@ class TaskCoordinator:
                 if task != winning_task and not task.done():
                     task.cancel()
 
-    async def _cleanup_losers(self):
+    async def _cleanup_losers(self) -> None:
         """
         A helper to gather all remaining runners and reap it
         """
@@ -114,7 +137,10 @@ class TaskCoordinator:
         for res in results:
             self.clean_up_task(res)
 
-    async def spawn(self, func, name=None, predecessor=None, delay=0.0):
+    async def spawn(self, func: Coroutine[None, None, T],
+                    name: Optional[str] = None,
+                    predecessor: Optional[asyncio.tasks.Task[None]] = None,
+                    delay: float = 0.0) -> Optional[asyncio.tasks.Task[None]]:
         """
         Run a new task under the coordinator.
         Wait until predecessor fails or delay seconds, whichever is faster.
@@ -181,7 +207,8 @@ class TaskCoordinator:
         task.add_done_callback(lambda t: self.active_tasks.discard(t))
         return task
 
-    async def run_until_complete(self, raise_exception=True):
+    async def run_until_complete(self, raise_exception: bool=True
+                                 ) -> Optional[T]:
         """Run tasks and wait a winner"""
         while not self.winner_event.is_set() and self.active_tasks:
             done, _ = await asyncio.wait(
@@ -206,7 +233,7 @@ class AsyncConnector:
     """
 
     @staticmethod
-    def _force_close_socket(sock: socket.socket):
+    def _force_close_socket(sock: socket.socket) -> None:
         """terminate a socket by RST"""
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
@@ -214,12 +241,17 @@ class AsyncConnector:
         except Exception:
             pass
 
-    def _looser_sentinel(self, res):
+    def _looser_sentinel(self, res: Optional[socket.socket]) -> None:
         """Call-back for every returned but not selected results."""
         if res is not None:
             self._force_close_socket(res)
 
-    async def _connect_singleip_worker(self, addr_info, mask, worker_id):
+    async def _connect_singleip_worker(
+            self,
+            addr_info: tuple,
+            mask: Optional[int],
+            worker_id: str
+            ) -> Optional[socket.socket]:
         loop = asyncio.get_running_loop()
 
         family, type_, proto, canonname, sockaddr = addr_info
@@ -282,7 +314,9 @@ class AsyncConnector:
             self._force_close_socket(sock)
             return None
 
-    async def _host_happy_eyeballs_worker(self, hostspec, worker_id):
+    async def _host_happy_eyeballs_worker(
+            self, hostspec: HostSpec, worker_id: str,
+        ) -> Optional[socket.socket]:
         """Worker coroutine for a single DNS-named host.
         Spawn sub-coroutine for IP addresses among several IP addresses."""
 
@@ -330,7 +364,10 @@ class AsyncConnector:
             await asyncio.wait([prev_ip_task])
             dp(f"connection to {host}: waiting for task {prev_ip_task.get_name()} done. finishing")
 
-    async def _async_get_fastest_connection_core(self, hosts, raise_exception=True):
+    async def _async_get_fastest_connection_core(
+            self,
+            hosts: Iterable[_HostSpec_Argument],
+            raise_exception: bool = True) -> Optional[socket.socket]:
         """The main coroutine of get_fastest_connection.
         Use get_fastest_connection or async_get_fastest_connection below."""
         self.coord = coord = TaskCoordinator(clean_up_task=self._looser_sentinel)
@@ -351,8 +388,11 @@ class AsyncConnector:
 
         return result
 
-    def __init__(self, msg=None, diag=None, use_v4=True, use_v6=True,
-                 happy_eyeballs_delay=0.25):
+    def __init__(self, msg: Optional[Callable[[str], Any]] = None,
+                 diag: Optional[Callable[[str], Any]] = None,
+                 use_v4: bool = True,
+                 use_v6: bool = True,
+                 happy_eyeballs_delay: float = 0.25):
         """ONLY called from get_fastest_connection"""
         self.use_v4 = use_v4
         self.use_v6 = use_v6
@@ -362,7 +402,11 @@ class AsyncConnector:
 
     # Two public APIs for general use
     @classmethod
-    def get_fastest_connection(klass, hosts, **k):
+    def get_fastest_connection(
+        klass,
+        hosts: Iterable[_HostSpec_Argument],
+        **k,
+        ) -> Optional[socket.socket]:
         """Try simultanously connecting to given host lists and return the ealienst available one.
 
            The argument is a list of HostSpec's containing the
@@ -427,7 +471,15 @@ class AsyncConnector:
                 raise
 
     @classmethod
-    async def async_get_fastest_connection(klass, hosts, rawsocket=False, **kwargs):
+    async def async_get_fastest_connection(
+            klass,
+            hosts: Iterable[_HostSpec_Argument],
+            rawsocket: bool = False,
+            **kwargs,
+            ) -> Union[
+                Optional[socket.socket],
+                tuple[Optional[asyncio.streams.StreamReader],
+                      Optional[asyncio.streams.StreamWriter]]]:
         """Try simultanously connecting to given host lists and return the fastest one.
 
            See get_fastest_connection for arguments.
@@ -523,17 +575,17 @@ try:
 except NameError:
     is_posix_available = False # no-existence of socket.socket is unlikely...
 
-def _make_msgpack_errormsg(m):
+def _make_msgpack_errormsg(m: str) -> bytes:
     m = m.encode("utf-8")
     return b"\x92\xc2\xda" + len(m).to_bytes(2, byteorder="big") + m
 
-def _make_msgpack_message(m):
+def _make_msgpack_message(m: Optional[bytes]) -> bytes:
     if m is None:
         return b"\x92\xc3\xc0"
     else:
         return b"\x92\xc3\xc5" + len(m).to_bytes(2, byteorder="big") + m
 
-def _pass_sock_to_fd(channel_fd, sock_to_pass):
+def _pass_sock_to_fd(channel_fd: int, sock_to_pass: socket.socket) -> None:
     file_sock = os.fdopen(channel_fd, "wb", closefd=False)
     try:
         channel_sock = socket.fromfd(channel_fd, socket.AF_UNIX, socket.SOCK_STREAM)
@@ -545,9 +597,9 @@ def _pass_sock_to_fd(channel_fd, sock_to_pass):
         file_sock.write(_make_msgpack_errormsg(repr(e)))
         traceback.print_exception(e)
 
-def _pass_sock_win32(pid, sock_to_pass):
+def _pass_sock_win32(pid: int, sock_to_pass: socket.socket) -> None:
     try:
-        wsainfo_blob = sock_to_pass.share(pid)
+        wsainfo_blob = sock_to_pass.share(pid) #type: ignore
         sys.stdout.buffer.write(_make_msgpack_message(wsainfo_blob))
         sys.stdout.buffer.flush()
         dp("waiting for ack byte")
@@ -582,10 +634,10 @@ class ParagraphFillingFormatter(argparse.RawDescriptionHelpFormatter):
         ps = '\n\n'.join(ps)
         return ps
 
-def main():
-    use_messagepack = False
+def main() -> None:
+    use_messagepack: bool = False
 
-    hostlist = []
+    hostlist: list[HostSpec] = []
 
     parser = argparse.ArgumentParser(
         description = "A TCP proxy that chooses the first available connection from multiple destination candidates.",
@@ -663,11 +715,11 @@ attempt for this spec is skipped.
 
         c = asyncio.run(
                 AsyncConnector(
-                    use_v4=use_v4,
-                    use_v6=use_v6,
+                    use_v4 = use_v4,
+                    use_v6 = use_v6,
                     msg = msg.write,
                     diag = diag.write,
-                    happy_eyeballs_delay=args.delay).
+                    happy_eyeballs_delay = args.delay).
                     _async_get_fastest_connection_core(hostlist, raise_exception=False))
 
         if not c:
@@ -704,15 +756,15 @@ attempt for this spec is skipped.
         c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         c.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         Forwarder.run_parallel(
-            ((c, sys.stdout.buffer.raw),
-             (sys.stdin.buffer.raw, c)))
+            ((c, sys.stdout.buffer.raw), #type: ignore
+             (sys.stdin.buffer.raw, c))) #type: ignore
 
     c.close()
 
     sys.exit(0)
 
+get_fastest_connection = AsyncConnector.get_fastest_connection
+async_get_fastest_connection = AsyncConnector.async_get_fastest_connection
+
 if __name__ == '__main__':
     main()
-else:
-    get_fastest_connection = AsyncConnector.get_fastest_connection
-    async_get_fastest_connection = AsyncConnector.async_get_fastest_connection
