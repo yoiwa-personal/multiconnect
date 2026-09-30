@@ -589,7 +589,7 @@ def _pass_sock_to_fd(channel_fd: int, sock_to_pass: socket.socket) -> None:
     file_sock = os.fdopen(channel_fd, "wb", closefd=False)
     try:
         channel_sock = socket.fromfd(channel_fd, socket.AF_UNIX, socket.SOCK_STREAM)
-        x = socket.send_fds(channel_sock, [_make_msgpack_message(None)], fds=[sock_to_pass.fileno()])
+        x = socket.send_fds(channel_sock, [_make_msgpack_message(None)], fds=[sock_to_pass.fileno()]) #type: ignore
         dp("waiting for ack byte")
         r = sys.stdin.buffer.read(1)
         dp("ack byte received {r!r}", r=r)
@@ -742,9 +742,8 @@ attempt for this spec is skipped.
             traceback.print_exception(e)
 
         if use_messagepack:
-            of = os.fdopen(args.pass_fd, "wb") if args.pass_fd else sys.stdout.buffer
             b = _make_msgpack_errormsg(message)
-            of.write(b)
+            sys.stdout.buffer.write(b)
 
         sys.exit(1)
 
