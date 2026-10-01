@@ -14,7 +14,30 @@ def extract_socket_posix(io_sock):
     """Extract passed socket from UNIX domain socket using socket.recv_fds()."""
 
     # Read 3-byte header (b"\x92\xc3\xc0") and at most 1 file descriptor via SCM_RIGHTS
-    msg, fds, flags, addr = socket.recv_fds(io_sock, 3, 1)
+
+    if True:
+        # Python provides a handy function
+        msg, fds, flags, addr = socket.recv_fds(io_sock, 3, 1)
+    else:
+        # A bit more hints for implementations in other languages.
+        # Quoted from https://docs.python.org/3/library/socket.html with modifications.
+        # see https://man7.org/tlpi/code/online/dist/sockets/scm_rights_recv.c.html
+        # for a native C-language API example.
+        import array
+        fds = array.array("i")
+        msg, ancdata, flags, addr = io_sock.recvmsg(3, socket.CMSG_LEN(1 * fds.itemsize))
+        for cmsg_level, cmsg_type, cmsg_data in ancdata:
+            if (cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS
+                and len(cmsg_data) >= fds.itemsize):
+                # Ignoring any excess bytes at the end.
+                fds.frombytes(cmsg_data[:(fds.itemsize)])
+                fds = list(fds)
+    while len(msg) < 3:
+        # not to happen: reading 3 bytes are certainly atomic
+        r = io_sock.recv(3 - len(msg))
+        if len(r) == 0:
+            break
+        msg = msg + r
 
     if not msg:
         raise ConnectionError("No data received from parent process")
@@ -24,12 +47,11 @@ def extract_socket_posix(io_sock):
             raise RuntimeError("Failed to receive file descriptor via SCM_RIGHTS")
         target_fd = fds[0]
         # Create socket from extracted FD
-        sock = socket.fromfd(target_fd, socket.AF_INET, socket.SOCK_STREAM)
-        os.close(target_fd)
+        sock = socket.socket(target_fd, socket.AF_INET, socket.SOCK_STREAM, fileno=target_fd)
 
     elif msg == b"\x92\xc2\xda":
-        len = io_sock.recv(2)
-        len, = struct.unpack("H", len)
+        errlen = io_sock.recv(2)
+        errlen, = struct.unpack("H", errlen)
         error_msg = io_sock.recv(len).decode("utf-8")
         raise RuntimeError(f"passed an error message: {error_msg!r}")
 
@@ -57,6 +79,7 @@ def extract_socket_win32(stdin_bin, stdout_bin):
         if len(proto_info) < length:
             raise ConnectionError("Incomplete WSAPROTOCOL_INFO payload")
         # Restore socket using socket.fromshare()
+        # proto_info is passed to the 4th lpProtocolInfo parameter of WSASocketW function.
         sock = socket.fromshare(proto_info)
 
     elif marker == b"\x92\xc2\xda":
