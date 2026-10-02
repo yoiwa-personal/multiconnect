@@ -47,7 +47,8 @@ def extract_socket_posix(io_sock):
             raise RuntimeError("Failed to receive file descriptor via SCM_RIGHTS")
         target_fd = fds[0]
         # Create socket from extracted FD
-        sock = socket.socket(target_fd, socket.AF_INET, socket.SOCK_STREAM, fileno=target_fd)
+        sock = socket.socket(-1, -1, -1, fileno=target_fd)
+        # passed -1s, Python will guess family, type and proto.
 
     elif msg == b"\x92\xc2\xda":
         errlen = io_sock.recv(2)
@@ -75,9 +76,11 @@ def extract_socket_win32(stdin_bin, stdout_bin):
 
     if marker == b"\x92\xc3\xc5":
         # Read 628 bytes WSAPROTOCOL_INFOW structure
+        if length != 628:
+            raise ConnectionError(f"Unexpected WSAPROTOCOL_INFO payload (expected 628, provided {length})")
         proto_info = stdin_bin.read(length)
         if len(proto_info) < length:
-            raise ConnectionError("Incomplete WSAPROTOCOL_INFO payload")
+            raise ConnectionError(f"Incomplete WSAPROTOCOL_INFO payload (sent {length}, read {len(proto_info)})")
         # Restore socket using socket.fromshare()
         # proto_info is passed to the 4th lpProtocolInfo parameter of WSASocketW function.
         sock = socket.fromshare(proto_info)
@@ -131,10 +134,13 @@ def main():
             stderr=sys.stderr,
         )
 
-    if is_posix:
-        sock = extract_socket_posix(parent_sock)
-    elif is_win32:
-        sock = extract_socket_win32(proc.stdout, proc.stdin)
+    with proc:
+        if is_posix:
+            sock = extract_socket_posix(parent_sock)
+        elif is_win32:
+            sock = extract_socket_win32(proc.stdout, proc.stdin)
+
+        print(f"Acquired a socket {sock!r}, family {sock.family}, type {sock.type}, proto {sock.proto}")
 
     try:
         http_request = (

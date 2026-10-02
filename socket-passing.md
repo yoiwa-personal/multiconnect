@@ -20,7 +20,7 @@ or (for future possibility only):
 
     0x92 0xc2 0xd9 (1-byte integer length n) (n bytes of error message in UTF-8)
 
-In MessagePack, this corresponds to `[false, "error message"]`.
+In MessagePack, these correspond to `[false, "error message"]`.
 
 ## POSIX Implementation
 
